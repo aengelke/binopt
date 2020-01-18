@@ -1,0 +1,3 @@
+option('build_dbrew', type: 'boolean')
+option('build_dbrew_llvm', type: 'boolean')
+option('build_dbll', type: 'boolean')
