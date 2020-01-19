@@ -154,6 +154,10 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
         llvm::Type* arg_type = arg->getType();
         llvm::Value* arg_val = arg;
 
+        if (cfg->params[arg_idx].ty == BINOPT_TY_PTR_NOALIAS) {
+            fn->addParamAttr(arg_idx, llvm::Attribute::NoAlias);
+        }
+
         // Fix known parameters
         if (const void* const_vptr = cfg->params[arg_idx].const_val) {
             auto const_ptr = reinterpret_cast<const uint64_t*>(const_vptr);
