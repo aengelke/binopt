@@ -42,7 +42,9 @@ struct DbllHandle {
     llvm::Module mod;
     llvm::ExecutionEngine* jit;
 
-    DbllHandle() : ctx(), mod("binopt", ctx) {}
+    DbllHandle() : ctx(), mod("binopt", ctx) {
+        mod.setTargetTriple(llvm::sys::getProcessTriple());
+    }
 };
 
 BinoptHandle binopt_init(void) {
