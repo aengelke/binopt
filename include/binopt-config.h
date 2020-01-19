@@ -23,7 +23,7 @@ struct BinoptCfg {
     size_t param_alloc;
     struct BinoptCfgParam {
         BinoptType ty;
-        const void* const_val;
+        void* const_val;
     }* params;
 
     size_t memrange_count;

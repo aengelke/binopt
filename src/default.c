@@ -4,6 +4,7 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,6 +18,25 @@ WEAK const char* binopt_driver(void) {
 }
 WEAK BinoptHandle binopt_init(void) { return NULL; }
 WEAK void binopt_fini(BinoptHandle handle) {}
+
+static size_t binopt_type_size(BinoptType ty) {
+    switch (ty) {
+    case BINOPT_TY_VOID: return 0;
+    case BINOPT_TY_INT8: return sizeof(int8_t);
+    case BINOPT_TY_INT16: return sizeof(int16_t);
+    case BINOPT_TY_INT32: return sizeof(int32_t);
+    case BINOPT_TY_INT64: return sizeof(int64_t);
+    case BINOPT_TY_UINT8: return sizeof(uint8_t);
+    case BINOPT_TY_UINT16: return sizeof(uint16_t);
+    case BINOPT_TY_UINT32: return sizeof(uint32_t);
+    case BINOPT_TY_UINT64: return sizeof(uint64_t);
+    case BINOPT_TY_FLOAT: return sizeof(float);
+    case BINOPT_TY_DOUBLE: return sizeof(double);
+    case BINOPT_TY_PTR: return sizeof(void*);
+    case BINOPT_TY_PTR_NOALIAS: return sizeof(void*);
+    default: return 0;
+    }
+}
 
 WEAK BinoptCfgRef binopt_cfg_new(BinoptHandle handle,
                                  BinoptFunc base_func) {
@@ -38,12 +58,24 @@ WEAK BinoptCfgRef binopt_cfg_clone(BinoptCfgRef base_cfg) {
             free(new_cfg);
             return NULL;
         }
-        memcpy(new_params, base_cfg->params, sizeof(struct BinoptCfgParam) * base_cfg->param_count);
+        for (size_t i = 0; i < new_cfg->param_count; ++i) {
+            struct BinoptCfgParam* base_param = &base_cfg->params[i];
+            struct BinoptCfgParam* new_param = &new_params[i];
+            size_t const_size = binopt_type_size(base_param->ty);
+            new_param->ty = base_param->ty;
+            new_param->const_val = malloc(const_size);
+            // Silently don't clone constant values if we can't allocate memory
+            if (new_param->const_val != NULL)
+                memcpy(new_param->const_val, base_param->const_val, const_size);
+        }
         new_cfg->params = new_params;
     }
     if (base_cfg->memranges != NULL) {
         struct BinoptCfgMemrange* new_memranges = malloc(sizeof(struct BinoptCfgMemrange) * new_cfg->memrange_alloc);
         if (new_memranges == NULL) {
+            if (new_cfg->params)
+                for (size_t i = 0; i < new_cfg->param_count; ++i)
+                    free(new_cfg->params[i].const_val);
             free(new_cfg->params);
             free(new_cfg);
             return NULL;
@@ -80,7 +112,11 @@ WEAK void binopt_cfg_set(BinoptCfgRef cfg, BinoptOptFlags flag, size_t val) {}
 WEAK void binopt_cfg_set_param(BinoptCfgRef cfg, unsigned idx, const void* val) {
     if (idx >= cfg->param_count)
         return;
-    cfg->params[idx].const_val = val;
+    size_t const_size = binopt_type_size(cfg->params[idx].ty);
+    cfg->params[idx].const_val = malloc(const_size);
+    if (!cfg->params[idx].const_val)
+        return;
+    memcpy(cfg->params[idx].const_val, val, const_size);
 }
 WEAK void binopt_cfg_mem(BinoptCfgRef cfg, void* base, size_t size,
                          BinoptMemFlags flags) {
@@ -105,8 +141,11 @@ WEAK void binopt_cfg_mem(BinoptCfgRef cfg, void* base, size_t size,
     cfg->memranges[range_idx].flags = flags;
 }
 WEAK void binopt_cfg_free(BinoptCfgRef cfg) {
-    if (cfg->params)
+    if (cfg->params) {
+        for (size_t i = 0; i < cfg->param_count; ++i)
+            free(cfg->params[i].const_val);
         free(cfg->params);
+    }
     if (cfg->memranges)
         free(cfg->memranges);
     free(cfg);
