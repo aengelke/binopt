@@ -329,17 +329,13 @@ private:
 
         llvm::LLVMContext& ctx = target_ty->getContext();
         llvm::Constant* const_int = llvm::ConstantInt::get(ctx, const_mem.second);
+        llvm::Constant* const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
 
         std::cerr << "folded to: ";
-        const_int->print(llvm::errs());
+        const_val->print(llvm::errs());
         std::cerr << std::endl;
 
-        if (const_int->getType() == target_ty)
-            return const_int;
-
-        std::cerr << "but type doesn't match!!!" << std::endl;
-
-        return nullptr;
+        return const_val;
     }
 
 public:
