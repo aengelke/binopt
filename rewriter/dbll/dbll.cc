@@ -90,10 +90,12 @@ static llvm::FunctionType* dbll_map_function_type(BinoptCfgRef cfg) {
     return llvm::FunctionType::get(ret_ty, params, false);
 }
 
-static llvm::Function* dbll_lift_function(llvm::Module* mod, BinoptFunc func) {
+static llvm::Function* dbll_lift_function(llvm::Module* mod, BinoptCfgRef cfg) {
     LLConfig* rlcfg = ll_config_new();
+    ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
+
     LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
-    ll_func_decode(rlfn, reinterpret_cast<uintptr_t>(func));
+    ll_func_decode(rlfn, reinterpret_cast<uintptr_t>(cfg->func));
     llvm::Function* fn = llvm::unwrap<llvm::Function>(ll_func_lift(rlfn));
     ll_func_dispose(rlfn);
     ll_config_free(rlcfg);
@@ -421,7 +423,7 @@ static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Function* fn) {
 BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
 
-    llvm::Function* fn = dbll_lift_function(&handle->mod, cfg->func);
+    llvm::Function* fn = dbll_lift_function(&handle->mod, cfg);
     if (fn == nullptr) // in case something went wrong
         return cfg->func;
 
