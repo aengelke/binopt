@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-int64_t func(const int64_t* poly, int64_t x) {
+static int64_t func(const int64_t* poly, int64_t x) {
     int64_t res = 0;
     int64_t x_n = 1;
     for (int64_t i = 0; i < *poly; i++) {

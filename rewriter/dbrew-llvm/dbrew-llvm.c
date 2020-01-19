@@ -60,7 +60,7 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
         case BINOPT_MEM_CONST:
         case BINOPT_MEM_NESTED_CONST:
             dbrew_config_set_memrange(r, "<unknown>", false,
-                                      cfg->memranges[i].base,
+                                      (uint64_t) cfg->memranges[i].base,
                                       cfg->memranges[i].size);
             break;
         default:

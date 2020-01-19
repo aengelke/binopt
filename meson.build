@@ -6,7 +6,6 @@ project('binopt', ['c', 'cpp'],
 
 if get_option('warning_level').to_int() >= 3
   add_project_arguments(['-Wmissing-field-initializers',
-                         '-Wunused-parameter',
                          '-Wold-style-definition',
                          '-Wmissing-declarations',
                          '-Wmissing-prototypes',
@@ -28,6 +27,7 @@ if get_option('warning_level').to_int() >= 3
                         ], language: 'c')
 endif
 
+add_project_arguments(['-Wno-unused-parameter'], language: 'c')
 add_project_arguments(['-Wno-unused-parameter'], language: 'cpp')
 
 binopt_inc = include_directories('include')
