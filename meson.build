@@ -38,4 +38,5 @@ binopt = declare_dependency(include_directories: binopt_inc,
 
 subdir('rewriter')
 
+subdir('benchmarks')
 subdir('examples')
