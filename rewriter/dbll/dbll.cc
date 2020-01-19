@@ -395,8 +395,9 @@ public:
     }
 };
 
-static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Function* fn) {
-    llvm::PassBuilder pb;
+static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Module* mod,
+                                 llvm::TargetMachine* tm) {
+    llvm::PassBuilder pb(tm);
 
     llvm::LoopAnalysisManager lam(false);
     llvm::FunctionAnalysisManager fam(false);
@@ -416,14 +417,31 @@ static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Function* fn) {
                                        llvm::PassBuilder::OptimizationLevel ol) {
         fpm.addPass(ConstMemPropPass(cfg));
     });
-    auto fpm = pb.buildFunctionSimplificationPipeline(llvm::PassBuilder::O3,
-            llvm::PassBuilder::ThinLTOPhase::None, false);
+    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
 
-    fpm.run(*fn, fam);
+    mpm.run(*mod, mam);
 }
 
 BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
+
+    llvm::TargetOptions options;
+    options.EnableFastISel = false;
+
+    std::unique_ptr<llvm::Module> mod_ptr(&handle->mod);
+
+    std::string error;
+    llvm::EngineBuilder builder(std::move(mod_ptr));
+    builder.setEngineKind(llvm::EngineKind::JIT);
+    builder.setErrorStr(&error);
+    builder.setOptLevel(llvm::CodeGenOpt::Aggressive);
+    builder.setTargetOptions(options);
+
+    // Same as "-mcpu=native", but disable AVX for the moment.
+    llvm::SmallVector<std::string, 1> MAttrs;
+    MAttrs.push_back(std::string("-avx"));
+    llvm::Triple triple = llvm::Triple(llvm::sys::getProcessTriple());
+    llvm::TargetMachine* target = builder.selectTarget(triple, "x86-64", llvm::sys::getHostCPUName(), MAttrs);
 
     llvm::Function* fn = dbll_lift_function(&handle->mod, cfg);
     if (fn == nullptr) // in case something went wrong
@@ -443,28 +461,9 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     }
 
     // dbll_optimize_fast(wrapped_fn);
-    dbll_optimize_new_pm(cfg, wrapped_fn);
+    dbll_optimize_new_pm(cfg, &handle->mod, target);
 
-    wrapped_fn->print(llvm::dbgs());
-
-
-    std::unique_ptr<llvm::Module> mod_ptr(&handle->mod);
-
-    llvm::TargetOptions options;
-    options.EnableFastISel = false;
-
-    std::string error;
-    llvm::EngineBuilder builder(std::move(mod_ptr));
-    builder.setEngineKind(llvm::EngineKind::JIT);
-    builder.setErrorStr(&error);
-    builder.setOptLevel(llvm::CodeGenOpt::Aggressive);
-    builder.setTargetOptions(options);
-
-    // Same as "-mcpu=native", but disable AVX for the moment.
-    llvm::SmallVector<std::string, 1> MAttrs;
-    MAttrs.push_back(std::string("-avx"));
-    llvm::Triple triple = llvm::Triple(llvm::sys::getProcessTriple());
-    llvm::TargetMachine* target = builder.selectTarget(triple, "x86-64", llvm::sys::getHostCPUName(), MAttrs);
+    handle->mod.print(llvm::dbgs(), nullptr);
 
     llvm::ExecutionEngine* engine = builder.create(target);
     if (!engine)
