@@ -5,6 +5,7 @@
 #include <binopt.h>
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,6 +19,10 @@ struct BinoptCfg {
     BinoptHandle handle;
     BinoptFunc func;
     BinoptType ret_ty;
+
+    // Allow unsafe floating-point optimizations. 0 = none, 1 = all.
+    // Upper bits may define individual optimizations in future.
+    uint8_t fast_math;
 
     size_t param_count;
     size_t param_alloc;

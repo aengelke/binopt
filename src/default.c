@@ -45,6 +45,7 @@ WEAK BinoptCfgRef binopt_cfg_new(BinoptHandle handle,
         return NULL;
     cfg->handle = handle;
     cfg->func = base_func;
+    cfg->fast_math = 0;
     return cfg;
 }
 WEAK BinoptCfgRef binopt_cfg_clone(BinoptCfgRef base_cfg) {
@@ -108,7 +109,12 @@ WEAK void binopt_cfg_type(BinoptCfgRef cfg, unsigned count, BinoptType ret, ...)
 
     return;
 }
-WEAK void binopt_cfg_set(BinoptCfgRef cfg, BinoptOptFlags flag, size_t val) {}
+WEAK void binopt_cfg_set(BinoptCfgRef cfg, BinoptOptFlags flag, size_t val) {
+    switch (flag) {
+    case BINOPT_F_FASTMATH: cfg->fast_math = !!val; break;
+    default: break; // ignore unknown flags
+    }
+}
 WEAK void binopt_cfg_set_param(BinoptCfgRef cfg, unsigned idx, const void* val) {
     if (idx >= cfg->param_count)
         return;
