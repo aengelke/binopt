@@ -62,6 +62,11 @@ void BINOPT_API(cfg_free)(BinoptCfgRef cfg);
 BinoptFunc BINOPT_API(spec_create)(BinoptCfgRef cfg);
 void BINOPT_API(spec_delete)(BinoptHandle handle, BinoptFunc spec_func);
 
+// Convenience functions
+void BINOPT_API(cfg_set_parami)(BinoptCfgRef cfg, unsigned idx, size_t val);
+void BINOPT_API(cfg_set_paramp)(BinoptCfgRef cfg, unsigned idx, const void* ptr,
+                                size_t size, BinoptMemFlags flags);
+
 #undef BINOPT_API_NAME
 #undef BINOPT_API
 

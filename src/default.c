@@ -155,3 +155,13 @@ WEAK BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     return cfg->func;
 }
 WEAK void binopt_spec_delete(BinoptHandle handle, BinoptFunc spec_func) {}
+
+// Convenience functions
+void binopt_cfg_set_parami(BinoptCfgRef cfg, unsigned idx, size_t val) {
+    binopt_cfg_set_param(cfg, idx, &val);
+}
+void binopt_cfg_set_paramp(BinoptCfgRef cfg, unsigned idx, const void* ptr,
+                           size_t size, BinoptMemFlags flags) {
+    binopt_cfg_set_param(cfg, idx, &ptr);
+    binopt_cfg_mem(cfg, ptr, size, flags);
+}

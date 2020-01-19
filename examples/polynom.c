@@ -21,9 +21,7 @@ int main(int argc, char** argv) {
     BinoptCfgRef bcfg = binopt_cfg_new(boh, (BinoptFunc) func);
     binopt_cfg_type(bcfg, 2, BINOPT_TY_INT64, BINOPT_TY_PTR, BINOPT_TY_PTR);
     int64_t poly[] = {3, 2, 1, 1};
-    int64_t* poly_ptr = poly;
-    binopt_cfg_set_param(bcfg, 0, &poly_ptr);
-    binopt_cfg_mem(bcfg, poly, sizeof(poly), BINOPT_MEM_CONST);
+    binopt_cfg_set_paramp(bcfg, 0, poly, sizeof(poly), BINOPT_MEM_CONST);
 
     int64_t (* new_func)(const int64_t*, int64_t);
     *((BinoptFunc*) &new_func) = binopt_spec_create(bcfg);
