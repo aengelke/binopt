@@ -335,7 +335,11 @@ private:
 
         llvm::LLVMContext& ctx = target_ty->getContext();
         llvm::Constant* const_int = llvm::ConstantInt::get(ctx, const_mem.second);
-        llvm::Constant* const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
+        llvm::Constant* const_val;
+        if (target_ty->isPointerTy())
+            const_val = llvm::ConstantExpr::getIntToPtr(const_int, target_ty);
+        else
+            const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
 
         std::cerr << "folded to: ";
         const_val->print(llvm::errs());
