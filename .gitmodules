@@ -7,3 +7,6 @@
 [submodule "subprojects/rellume"]
 	path = subprojects/rellume
 	url = https://github.com/aengelke/rellume.git
+[submodule "subprojects/drob"]
+	path = subprojects/drob
+	url = https://github.com/davidhildenbrand/drob.git

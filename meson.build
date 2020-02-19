@@ -1,7 +1,7 @@
 project('binopt', ['c', 'cpp'],
         default_options: ['buildtype=debugoptimized',
                           'warning_level=3',
-                          'c_std=c99',
+                          'c_std=gnu99',
                           'cpp_std=c++17'])
 
 if get_option('warning_level').to_int() >= 3
