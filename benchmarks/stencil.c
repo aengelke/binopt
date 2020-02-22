@@ -130,8 +130,8 @@ int main(int argc, char** argv) {
 
         boh = binopt_init();
         BinoptCfgRef bcfg = binopt_cfg_new(boh, (BinoptFunc) stencil_generic);
-        binopt_cfg_type(bcfg, 5, BINOPT_TY_VOID, BINOPT_TY_PTR_NOALIAS, BINOPT_TY_PTR_NOALIAS,
-                        BINOPT_TY_PTR_NOALIAS, BINOPT_TY_UINT64, BINOPT_TY_UINT64);
+        binopt_cfg_type(bcfg, 4, BINOPT_TY_VOID, BINOPT_TY_PTR_NOALIAS, BINOPT_TY_PTR_NOALIAS,
+                        BINOPT_TY_PTR_NOALIAS, BINOPT_TY_UINT64);
         binopt_cfg_set(bcfg, BINOPT_F_FASTMATH, true);
         binopt_cfg_set_parami(bcfg, 3, mat_size);
         binopt_cfg_set_paramp(bcfg, 0, &stencil, sizeof(stencil), BINOPT_MEM_CONST);
