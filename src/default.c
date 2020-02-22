@@ -100,6 +100,8 @@ WEAK void binopt_cfg_type(BinoptCfgRef cfg, unsigned count, BinoptType ret, ...)
         return;
     }
 
+    cfg->param_alloc = count;
+
     va_start(args, ret);
     for (unsigned i = 0; i < count; ++i) {
         cfg->params[i].ty = va_arg(args, BinoptType);
