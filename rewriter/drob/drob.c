@@ -17,6 +17,14 @@ const char* binopt_driver(void) {
 }
 BinoptHandle binopt_init(void) {
     drob_setup();
+
+    const char* loglevel_env = getenv("DROB_LOGLEVEL");
+    if (loglevel_env) {
+        unsigned loglevel = strtoul(loglevel_env, NULL, 10);
+        if (drob_set_logging(stderr, loglevel))
+            fprintf(stderr, "binopt-drob: invalid loglevel %d\n", loglevel);
+    }
+
     return NULL;
 }
 void binopt_fini(BinoptHandle handle) {
@@ -46,8 +54,6 @@ static drob_param_type binopt_drob_map_ty(BinoptType ty) {
 BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     if (cfg->param_count > 6)
         return cfg->func;
-
-    drob_set_logging(stderr, DROB_LOGLEVEL_DEBUG);
 
     drob_param_type dty_ret = binopt_drob_map_ty(cfg->ret_ty);
     drob_param_type dty_args[6] = {0};
