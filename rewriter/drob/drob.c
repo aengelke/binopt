@@ -74,28 +74,28 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
             continue;
         switch (cfg->params[i].ty) {
         case BINOPT_TY_INT8:
-            drob_cfg_set_param_char(dcfg, i, *(char*) cfg->params[i].const_val);
+            drob_cfg_set_param_int8(dcfg, i, *(int8_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_INT16:
-            drob_cfg_set_param_short(dcfg, i, *(short*) cfg->params[i].const_val);
+            drob_cfg_set_param_int16(dcfg, i, *(int16_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_INT32:
-            drob_cfg_set_param_int(dcfg, i, *(int*) cfg->params[i].const_val);
+            drob_cfg_set_param_int32(dcfg, i, *(int32_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_INT64:
-            drob_cfg_set_param_longlong(dcfg, i, *(long long*) cfg->params[i].const_val);
+            drob_cfg_set_param_int64(dcfg, i, *(int64_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_UINT8:
-            drob_cfg_set_param_uchar(dcfg, i, *(unsigned char*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint8(dcfg, i, *(uint8_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_UINT16:
-            drob_cfg_set_param_ushort(dcfg, i, *(unsigned short*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint16(dcfg, i, *(uint16_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_UINT32:
-            drob_cfg_set_param_uint(dcfg, i, *(unsigned int*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint32(dcfg, i, *(uint32_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_UINT64:
-            drob_cfg_set_param_ulonglong(dcfg, i, *(unsigned long long*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint64(dcfg, i, *(uint64_t*) cfg->params[i].const_val);
             break;
         case BINOPT_TY_PTR:
         case BINOPT_TY_PTR_NOALIAS:
