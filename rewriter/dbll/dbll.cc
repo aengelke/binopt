@@ -97,7 +97,14 @@ static llvm::Function* dbll_lift_function(llvm::Module* mod, BinoptCfgRef cfg) {
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
 
     LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
-    ll_func_decode(rlfn, reinterpret_cast<uintptr_t>(cfg->func));
+    bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(cfg->func),
+                                   nullptr, nullptr);
+    if (fail) {
+        ll_func_dispose(rlfn);
+        ll_config_free(rlcfg);
+        return nullptr;
+    }
+
     llvm::Function* fn = llvm::unwrap<llvm::Function>(ll_func_lift(rlfn));
     ll_func_dispose(rlfn);
     ll_config_free(rlcfg);
