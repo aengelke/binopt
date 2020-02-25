@@ -33,6 +33,15 @@
 
 /* DBLL based on LLVM+Rellume, using default configuration API */
 
+namespace LogLevel {
+enum {
+    QUIET = 0,
+    WARNING,
+    INFO,
+    DEBUG,
+};
+} // namespace LogLevel
+
 const char* binopt_driver(void) {
     return "DBLL";
 }
@@ -248,23 +257,6 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
     return fn;
 }
 
-static void dbll_optimize_fast(llvm::Function* fn) {
-    llvm::legacy::FunctionPassManager pm(fn->getParent());
-    pm.doInitialization();
-
-    // replace CPU struct with scalars
-    pm.add(llvm::createSROAPass());
-    // instrcombine will get rid of lots of bloat from the CPU struct
-    pm.add(llvm::createInstructionCombiningPass(false));
-    // Simplify CFG, removes some redundant function exits and empty blocks
-    pm.add(llvm::createCFGSimplificationPass());
-    // Aggressive DCE to remove phi cycles, etc.
-    pm.add(llvm::createAggressiveDCEPass());
-
-    pm.run(*fn);
-    pm.doFinalization();
-}
-
 class ConstMemPropPass : public llvm::PassInfoMixin<ConstMemPropPass> {
     BinoptCfgRef cfg;
 public:
@@ -324,9 +316,11 @@ private:
 
         uint64_t addr_val = ConstantValue(addr).trunc(64).getLimitedValue();
 
-        std::cerr << "folding load: ";
-        load->print(llvm::errs());
-        std::cerr << " to 0x" << std::hex << addr_val << std::endl;
+        if (cfg->log_level >= LogLevel::DEBUG) {
+            std::cerr << "folding load: ";
+            load->print(llvm::errs());
+            std::cerr << " to 0x" << std::hex << addr_val << "\n";
+        }
 
         if (!addr_val)
             return nullptr;
@@ -348,9 +342,11 @@ private:
         else
             const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
 
-        std::cerr << "folded to: ";
-        const_val->print(llvm::errs());
-        std::cerr << std::endl;
+        if (cfg->log_level >= LogLevel::DEBUG) {
+            std::cerr << "folded to: ";
+            const_val->print(llvm::errs());
+            std::cerr << "\n";
+        }
 
         return const_val;
     }
@@ -474,7 +470,8 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     // dbll_optimize_fast(wrapped_fn);
     dbll_optimize_new_pm(cfg, &handle->mod, target);
 
-    handle->mod.print(llvm::dbgs(), nullptr);
+    if (cfg->log_level >= LogLevel::INFO)
+        handle->mod.print(llvm::dbgs(), nullptr);
 
     llvm::ExecutionEngine* engine = builder.create(target);
     if (!engine)
