@@ -56,6 +56,8 @@ typedef enum {
     BINOPT_F_STACKSZ,
     /// Fast-math optimizations flags.
     BINOPT_F_FASTMATH,
+    /// Log level verbosity. 0 = none/quiet (default).
+    BINOPT_F_LOGLEVEL,
 } BinoptOptFlags;
 
 const char* BINOPT_API(driver)(void);

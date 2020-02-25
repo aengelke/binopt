@@ -46,6 +46,15 @@ WEAK BinoptCfgRef binopt_cfg_new(BinoptHandle handle,
     cfg->handle = handle;
     cfg->func = base_func;
     cfg->fast_math = 0;
+    cfg->log_level = 0;
+
+    const char* log_level_env = getenv("BINOPT_LOGLEVEL");
+    if (log_level_env) {
+        unsigned log_level = strtoul(log_level_env, NULL, 10);
+        if (log_level < UINT8_MAX)
+            cfg->log_level = log_level;
+    }
+
     return cfg;
 }
 WEAK BinoptCfgRef binopt_cfg_clone(BinoptCfgRef base_cfg) {
@@ -114,6 +123,7 @@ WEAK void binopt_cfg_type(BinoptCfgRef cfg, unsigned count, BinoptType ret, ...)
 WEAK void binopt_cfg_set(BinoptCfgRef cfg, BinoptOptFlags flag, size_t val) {
     switch (flag) {
     case BINOPT_F_FASTMATH: cfg->fast_math = !!val; break;
+    case BINOPT_F_LOGLEVEL: cfg->log_level = val; break;
     default: break; // ignore unknown flags
     }
 }

@@ -23,6 +23,8 @@ struct BinoptCfg {
     // Allow unsafe floating-point optimizations. 0 = none, 1 = all.
     // Upper bits may define individual optimizations in future.
     uint8_t fast_math;
+    // Log level verbosity. 0 = none/quiet
+    uint8_t log_level;
 
     size_t param_count;
     size_t param_alloc;
