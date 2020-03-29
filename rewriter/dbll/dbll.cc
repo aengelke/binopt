@@ -48,11 +48,11 @@ const char* binopt_driver(void) {
 
 struct DbllHandle {
     llvm::LLVMContext ctx;
-    llvm::Module mod;
+    std::unique_ptr<llvm::Module> mod;
     llvm::ExecutionEngine* jit;
 
-    DbllHandle() : ctx(), mod("binopt", ctx) {
-        mod.setTargetTriple(llvm::sys::getProcessTriple());
+    DbllHandle() : ctx(), mod(std::make_unique<llvm::Module>("binopt", ctx)) {
+        mod->setTargetTriple(llvm::sys::getProcessTriple());
     }
 };
 
@@ -435,10 +435,10 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     llvm::TargetOptions options;
     options.EnableFastISel = false;
 
-    std::unique_ptr<llvm::Module> mod_ptr(&handle->mod);
+    llvm::Module* mod_ptr = handle->mod.get();
 
     std::string error;
-    llvm::EngineBuilder builder(std::move(mod_ptr));
+    llvm::EngineBuilder builder(std::move(handle->mod));
     builder.setEngineKind(llvm::EngineKind::JIT);
     builder.setErrorStr(&error);
     builder.setOptLevel(llvm::CodeGenOpt::Aggressive);
@@ -450,7 +450,7 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     llvm::Triple triple = llvm::Triple(llvm::sys::getProcessTriple());
     llvm::TargetMachine* target = builder.selectTarget(triple, "x86-64", llvm::sys::getHostCPUName(), MAttrs);
 
-    llvm::Function* fn = dbll_lift_function(&handle->mod, cfg);
+    llvm::Function* fn = dbll_lift_function(mod_ptr, cfg);
     if (fn == nullptr) // in case something went wrong
         return cfg->func;
 
@@ -468,10 +468,10 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     }
 
     // dbll_optimize_fast(wrapped_fn);
-    dbll_optimize_new_pm(cfg, &handle->mod, target);
+    dbll_optimize_new_pm(cfg, mod_ptr, target);
 
     if (cfg->log_level >= LogLevel::INFO)
-        handle->mod.print(llvm::dbgs(), nullptr);
+        mod_ptr->print(llvm::dbgs(), nullptr);
 
     llvm::ExecutionEngine* engine = builder.create(target);
     if (!engine)
