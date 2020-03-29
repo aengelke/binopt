@@ -1,3 +1,5 @@
 executable('simple', 'simple.c', dependencies: [binopt])
+executable('manyparams', 'manyparams.c', dependencies: [binopt])
+executable('fastexp', 'fastexp.c', dependencies: [binopt])
 executable('memory', 'memory.c', dependencies: [binopt])
 executable('polynom', 'polynom.c', dependencies: [binopt])
