@@ -164,6 +164,8 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
     unsigned gp_regs[6] = { 7, 6, 2, 1, 8, 9 };
     unsigned gpRegOffset = 0;
     unsigned fpRegOffset = 0;
+    unsigned stackOffset = 8;
+    llvm::SmallVector<std::pair<size_t, llvm::Value*>, 4> stack_slots;
     llvm::Value* target;
     unsigned arg_idx = 0;
     for (auto arg = fn->arg_begin(); arg != fn->arg_end(); ++arg, ++arg_idx) {
@@ -185,38 +187,53 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
         }
 
         if (arg_type->isIntOrPtrTy()) {
-            if (gpRegOffset >= 6)
-                return nullptr;
-            target = dbll_gep_helper(irb, alloca, {0, 1, gp_regs[gpRegOffset]});
-            llvm::Type* target_ty = target->getType()->getPointerElementType();
-            if (arg_type->isPointerTy())
-                arg_val = irb.CreatePtrToInt(arg_val, target_ty);
-            else // arg_type->isIntegerTy()
-                arg_val = irb.CreateZExtOrTrunc(arg_val, target_ty);
-            irb.CreateStore(arg_val, target);
-            gpRegOffset++;
-        } else if (arg_type->isFloatTy() || arg_type->isDoubleTy()) {
-            if (fpRegOffset >= 8)
-                return nullptr;
-            target = dbll_gep_helper(irb, alloca, {0, 4, fpRegOffset});
+            if (gpRegOffset < 6) {
+                if (arg_type->isPointerTy())
+                    arg_val = irb.CreatePtrToInt(arg_val, irb.getInt64Ty());
+                else // arg_type->isIntegerTy()
+                    arg_val = irb.CreateZExtOrTrunc(arg_val, irb.getInt64Ty());
 
-            llvm::Type* int_type = irb.getIntNTy(arg_type->getPrimitiveSizeInBits());
-            llvm::Type* vec_type = target->getType()->getPointerElementType();
-            llvm::Value* int_val = irb.CreateBitCast(arg_val, int_type);
-            irb.CreateStore(irb.CreateZExt(int_val, vec_type), target);
-            fpRegOffset++;
+                target = dbll_gep_helper(irb, alloca, {0, 1, gp_regs[gpRegOffset]});
+                irb.CreateStore(arg_val, target);
+                gpRegOffset++;
+            } else {
+                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
+                stackOffset += 8;
+            }
+        } else if (arg_type->isFloatTy() || arg_type->isDoubleTy()) {
+            if (fpRegOffset < 8) {
+                llvm::Type* int_type = irb.getIntNTy(arg_type->getPrimitiveSizeInBits());
+                llvm::Value* int_val = irb.CreateBitCast(arg_val, int_type);
+
+                target = dbll_gep_helper(irb, alloca, {0, 4, fpRegOffset});
+                llvm::Type* vec_type = target->getType()->getPointerElementType();
+                irb.CreateStore(irb.CreateZExt(int_val, vec_type), target);
+                fpRegOffset++;
+            } else {
+                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
+                stackOffset += 8;
+            }
         } else {
             return nullptr;
         }
     }
 
-    std::size_t stack_size = 4096;
+    std::size_t stack_frame_size = 4096;
+    std::size_t stack_size = stack_frame_size;
+    if (stackOffset > 8) // return address
+        stack_size += stackOffset;
+
     llvm::Value* stack_sz_val = irb.getInt64(stack_size);
     llvm::AllocaInst* stack = irb.CreateAlloca(irb.getInt8Ty(), stack_sz_val);
     stack->setAlignment(16);
-    llvm::Value* sp_ptr = irb.CreateGEP(stack, stack_sz_val);
+    llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
     llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
     irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
+
+    for (const auto& [offset, value] : stack_slots) {
+        llvm::Value* ptr = irb.CreateGEP(sp_ptr, irb.getInt64(offset));
+        irb.CreateStore(value, irb.CreateBitCast(ptr, value->getType()->getPointerTo()));
+    }
 
     llvm::Value* call_arg = irb.CreatePointerCast(alloca, irb.getInt8PtrTy());
     llvm::CallInst* call = irb.CreateCall(orig_fn, {call_arg});
