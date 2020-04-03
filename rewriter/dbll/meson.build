@@ -1,4 +1,4 @@
-libllvm = dependency('llvm', version: ['>=8', '<=9'])
+libllvm = dependency('llvm', version: ['>=8', '<10'])
 cpp_args = ['-DDBLL_LLVM_MAJOR='+libllvm.version().split('.')[0]]
 
 rellume = subproject('rellume')

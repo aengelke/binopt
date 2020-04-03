@@ -12,6 +12,7 @@
 #include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -21,6 +22,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
 
@@ -46,19 +48,138 @@ const char* binopt_driver(void) {
     return "DBLL";
 }
 
+static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
+    llvm::LLVMContext& ctx = mod->getContext();
+
+    llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
+    llvm::Type* i64p = llvm::Type::getInt64Ty(ctx)->getPointerTo();
+    llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
+    auto fn_ty = llvm::FunctionType::get(void_ty, {i8p, i64p}, false);
+    auto linkage = llvm::GlobalValue::PrivateLinkage;
+    llvm::Function* fn = llvm::Function::Create(fn_ty, linkage,
+                                                "dbll_native_helper", mod);
+
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "", fn);
+    llvm::IRBuilder<> irb(bb);
+
+    // We need some memory space addressable without any(!) registers except for
+    // rip where we can store the stack pointer. As the LLVM MCJIT doesn's
+    // implement thread-local storage, we opt for a global variable.
+    llvm::GlobalValue* glob_slot = new llvm::GlobalVariable(*mod,
+                irb.getInt64Ty(), false, llvm::GlobalValue::PrivateLinkage,
+                irb.getInt64(0), "dbll_native_helper_rsp");
+
+    llvm::Value* sptr = irb.CreateBitCast(&fn->arg_begin()[0], i64p);
+
+    llvm::Value* stored_rip_ptr = &fn->arg_begin()[1];
+    llvm::Value* orig_stored_rip = irb.CreateLoad(irb.getInt64Ty(), stored_rip_ptr);
+
+    llvm::SmallVector<llvm::Value*, 10> sptr_geps;
+    for (uint8_t idx : {4, 6, 9, 10, 11, 12, 13, 14, 15, 16})
+        sptr_geps.push_back(irb.CreateConstGEP1_64(sptr, idx));
+
+    llvm::SmallVector<llvm::Value*, 16> asm_args;
+    asm_args.push_back(irb.CreatePtrToInt(sptr, irb.getInt64Ty()));
+    asm_args.push_back(irb.CreatePtrToInt(&fn->arg_begin()[1], irb.getInt64Ty()));
+    asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), sptr)); // rip
+    asm_args.push_back(irb.getInt64(0x202)); // rflags
+    asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), irb.CreateConstGEP1_64(sptr, 5))); // rsp
+    for (llvm::Value* ptr : sptr_geps)
+        asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
+    asm_args.push_back(glob_slot);
+
+    llvm::SmallVector<llvm::Type*, 16> ty_list(15, irb.getInt64Ty());
+    auto asm_ret_ty = llvm::StructType::get(ctx, ty_list);
+    ty_list.push_back(irb.getInt64Ty()->getPointerTo());
+    auto asm_ty = llvm::FunctionType::get(asm_ret_ty, ty_list, false);
+    // So, first we have: CPU state, ret_addr ptr, rip, rflags, rsp
+    // These are followed by the 10 remaining free registers.
+    // TODO: we actually retain RDI, update constraints to reflect this.
+    const auto constraints =
+        "={di},={si},={ax},={cx},={dx},={bx},={bp},={r8},={r9},={r10},={r11},"
+        "={r12},={r13},={r14},={r15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,i";
+    const auto asm_code =
+            "sub $$0x30, %rsp;"
+            "mov %rax, 0x00(%rsp);" // user rip
+            "mov %cs, 0x08(%rsp);"
+            "mov %rcx, 0x10(%rsp);" // user rflags
+            "mov %rdx, 0x18(%rsp);" // user rsp
+            "mov %ss, 0x20(%rsp);"
+            "mov %rdi, 0x28(%rsp);" // Store CPU state (not for iretq)
+
+            // Store rsp in a safe place.
+            // Fill return address in custom stack, so that the function returns to 1f
+            "movabs $30, %rax;"
+            "lea 1f(%rip), %rdx;"
+            "mov %rsp, (%rax);"
+            "mov %rdx, (%rsi);"
+
+            // Set remaining registers do rdi last.
+            "mov 1*8(%rdi), %rax;"
+            "mov 2*8(%rdi), %rcx;"
+            "mov 3*8(%rdi), %rdx;"
+            "mov 7*8(%rdi), %rsi;"
+            "mov 8*8(%rdi), %rdi;"
+
+            "iretq;" // isn't this cool? -- no, it isn't.
+        "1:" // TODO: perhaps check rsp somehow?
+            "movabs $30, %rsp;" // throw away user rsp.
+            "mov (%rsp), %rsp;"
+            "mov %rdi, (%rsp);" // temporarily store rdi on the stack
+            "mov 0x28(%rsp), %rdi;" // rdi is now the CPU structure
+
+            "mov %rax, 1*8(%rdi);"
+            "mov (%rsp), %rax;"
+            "mov %rax, 8*8(%rdi);" // user rdi
+            "mov %rcx, 2*8(%rdi);"
+            "mov %rdx, 3*8(%rdi);"
+            "mov %rsi, 7*8(%rdi);"
+            "add $$0x30, %rsp;";
+
+    auto asm_inst = llvm::InlineAsm::get(asm_ty, asm_code, constraints,
+                                         /*hasSideEffects=*/true,
+                                         /*alignStack=*/true,
+                                         llvm::InlineAsm::AD_ATT);
+    llvm::Value* asm_res = irb.CreateCall(asm_inst, asm_args);
+
+    // Move the RIP where the previous function returned to to the CPU state.
+    irb.CreateStore(orig_stored_rip, sptr);
+    for (unsigned i = 0; i < sptr_geps.size(); i++)
+        irb.CreateStore(irb.CreateExtractValue(asm_res, i + 5), sptr_geps[i]);
+
+    irb.CreateRetVoid();
+
+    return fn;
+}
+
 struct DbllHandle {
     llvm::LLVMContext ctx;
     std::unique_ptr<llvm::Module> mod;
     llvm::ExecutionEngine* jit;
 
+    llvm::Function* rl_func_call;
+    llvm::Function* rl_func_tail;
+    llvm::Function* native_helper;
+
     DbllHandle() : ctx(), mod(std::make_unique<llvm::Module>("binopt", ctx)) {
         mod->setTargetTriple(llvm::sys::getProcessTriple());
+
+        llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
+        llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
+        auto helper_ty = llvm::FunctionType::get(void_ty, {i8p}, false);
+        auto linkage = llvm::GlobalValue::ExternalLinkage;
+        rl_func_call = llvm::Function::Create(helper_ty, linkage, "call_fn",
+                                              mod.get());
+        rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn",
+                                              mod.get());
+        native_helper = dbll_create_native_helper(mod.get());
     }
 };
 
 BinoptHandle binopt_init(void) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
     return reinterpret_cast<BinoptHandle>(new DbllHandle());
 }
 void binopt_fini(BinoptHandle handle) {
@@ -102,8 +223,12 @@ static llvm::FunctionType* dbll_map_function_type(BinoptCfgRef cfg) {
 }
 
 static llvm::Function* dbll_lift_function(llvm::Module* mod, BinoptCfgRef cfg) {
+    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
+
     LLConfig* rlcfg = ll_config_new();
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
+    ll_config_set_tail_func(rlcfg, llvm::wrap(handle->rl_func_tail));
+    ll_config_set_call_func(rlcfg, llvm::wrap(handle->rl_func_call));
 
     LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
     bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(cfg->func),
@@ -142,6 +267,8 @@ static llvm::Value* dbll_gep_helper(llvm::IRBuilder<>& irb, llvm::Value* base,
 
 static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
                                           llvm::Function* orig_fn) {
+    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
+
     llvm::FunctionType* fnty = dbll_map_function_type(cfg);
     if (fnty == nullptr) // if we don't support the type
         return nullptr;
@@ -164,7 +291,7 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
     unsigned gp_regs[6] = { 7, 6, 2, 1, 8, 9 };
     unsigned gpRegOffset = 0;
     unsigned fpRegOffset = 0;
-    unsigned stackOffset = 8;
+    unsigned stackOffset = 8; // return address
     llvm::SmallVector<std::pair<size_t, llvm::Value*>, 4> stack_slots;
     llvm::Value* target;
     unsigned arg_idx = 0;
@@ -219,9 +346,7 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
     }
 
     std::size_t stack_frame_size = 4096;
-    std::size_t stack_size = stack_frame_size;
-    if (stackOffset > 8) // return address
-        stack_size += stackOffset;
+    std::size_t stack_size = stack_frame_size + stackOffset;
 
     llvm::Value* stack_sz_val = irb.getInt64(stack_size);
     llvm::AllocaInst* stack = irb.CreateAlloca(irb.getInt8Ty(), stack_sz_val);
@@ -229,6 +354,9 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
     llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
     llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
     irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
+    // Construct bitcast here, to avoid strange things after inlining.
+    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
+    llvm::Value* ret_addr_slot = irb.CreateBitCast(sp_ptr, i64p);
 
     for (const auto& [offset, value] : stack_slots) {
         llvm::Value* ptr = irb.CreateGEP(sp_ptr, irb.getInt64(offset));
@@ -270,6 +398,41 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
 
     llvm::InlineFunctionInfo ifi;
     llvm::InlineFunction(llvm::CallSite(call), ifi);
+
+    // Now, we replace all calls to the temporary tail function to our real tail
+    // function, which takes an extra parameter. The difference between
+    // tail_func and call_func is the following: For tail_func, we hook the
+    // return address of this function (that is in ret_addr_slot). For call_func
+    // we must hook the return address which was just stored on the fake stack.
+
+    llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
+    for (const llvm::Use& use : handle->rl_func_tail->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
+        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+    }
+    for (llvm::CallInst* inst : tmp_insts) {
+        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_slot};
+        auto* new_inst = llvm::CallInst::Create(handle->native_helper, args);
+        llvm::ReplaceInstWithInst(inst, new_inst);
+    }
+    tmp_insts.clear();
+
+    for (const llvm::Use& use : handle->rl_func_call->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
+        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+    }
+    for (llvm::CallInst* inst : tmp_insts) {
+        irb.SetInsertPoint(inst);
+        llvm::Value* sp_ptr = dbll_gep_helper(irb, alloca, {0, 1, 4});
+        sp_ptr = irb.CreateBitCast(sp_ptr, i64p->getPointerTo());
+        llvm::Value* ret_addr_ptr = irb.CreateLoad(i64p, sp_ptr);
+        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_ptr};
+        auto* new_inst = llvm::CallInst::Create(handle->native_helper, args);
+        llvm::ReplaceInstWithInst(inst, new_inst);
+    }
+    tmp_insts.clear();
 
     return fn;
 }
