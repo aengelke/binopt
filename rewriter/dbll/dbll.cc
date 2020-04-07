@@ -22,6 +22,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/TargetRegistry.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
@@ -170,26 +171,8 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
 
 struct DbllHandle {
     llvm::LLVMContext ctx;
-    std::unique_ptr<llvm::Module> mod;
-    llvm::ExecutionEngine* jit;
 
-    llvm::Function* rl_func_call;
-    llvm::Function* rl_func_tail;
-    llvm::Function* native_helper;
-
-    DbllHandle() : ctx(), mod(std::make_unique<llvm::Module>("binopt", ctx)) {
-        mod->setTargetTriple(llvm::sys::getProcessTriple());
-
-        llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
-        llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
-        auto helper_ty = llvm::FunctionType::get(void_ty, {i8p}, false);
-        auto linkage = llvm::GlobalValue::ExternalLinkage;
-        rl_func_call = llvm::Function::Create(helper_ty, linkage, "call_fn",
-                                              mod.get());
-        rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn",
-                                              mod.get());
-        native_helper = dbll_create_native_helper(mod.get());
-    }
+    DbllHandle() : ctx() {}
 };
 
 BinoptHandle binopt_init(void) {
@@ -238,30 +221,6 @@ static llvm::FunctionType* dbll_map_function_type(BinoptCfgRef cfg) {
     return llvm::FunctionType::get(ret_ty, params, false);
 }
 
-static llvm::Function* dbll_lift_function(llvm::Module* mod, BinoptCfgRef cfg) {
-    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
-
-    LLConfig* rlcfg = ll_config_new();
-    ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
-    ll_config_set_tail_func(rlcfg, llvm::wrap(handle->rl_func_tail));
-    ll_config_set_call_func(rlcfg, llvm::wrap(handle->rl_func_call));
-
-    LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
-    bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(cfg->func),
-                                   nullptr, nullptr);
-    if (fail) {
-        ll_func_dispose(rlfn);
-        ll_config_free(rlcfg);
-        return nullptr;
-    }
-
-    llvm::Function* fn = llvm::unwrap<llvm::Function>(ll_func_lift(rlfn));
-    ll_func_dispose(rlfn);
-    ll_config_free(rlcfg);
-
-    return fn;
-}
-
 static llvm::Type* dbll_get_cpu_type(llvm::LLVMContext& ctx) {
     // TODO: extract from rellume programatically
     llvm::SmallVector<llvm::Type*, 4> cpu_types;
@@ -279,179 +238,6 @@ static llvm::Value* dbll_gep_helper(llvm::IRBuilder<>& irb, llvm::Value* base,
     for (auto& idx : idxs)
         consts.push_back(irb.getInt32(idx));
     return irb.CreateGEP(base, consts);
-}
-
-static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
-                                          llvm::Function* orig_fn) {
-    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
-
-    llvm::FunctionType* fnty = dbll_map_function_type(cfg);
-    if (fnty == nullptr) // if we don't support the type
-        return nullptr;
-
-    // Create new function
-    llvm::LLVMContext& ctx = orig_fn->getContext();
-    auto linkage = llvm::GlobalValue::ExternalLinkage;
-    llvm::Function* fn = llvm::Function::Create(fnty, linkage, "glob",
-                                                orig_fn->getParent());
-    llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "", fn);
-    llvm::IRBuilder<> irb(bb);
-
-    // Allocate CPU struct
-    llvm::Type* cpu_type = dbll_get_cpu_type(ctx);
-    llvm::AllocaInst* alloca = irb.CreateAlloca(cpu_type, int{0});
-    alloca->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {}));
-
-    // Set direction flag to zero
-    irb.CreateStore(irb.getFalse(), dbll_gep_helper(irb, alloca, {0, 2, 6}));
-
-    unsigned gp_regs[6] = { 7, 6, 2, 1, 8, 9 };
-    unsigned gpRegOffset = 0;
-    unsigned fpRegOffset = 0;
-    unsigned stackOffset = 8; // return address
-    llvm::SmallVector<std::pair<size_t, llvm::Value*>, 4> stack_slots;
-    llvm::Value* target;
-    unsigned arg_idx = 0;
-    for (auto arg = fn->arg_begin(); arg != fn->arg_end(); ++arg, ++arg_idx) {
-        llvm::Type* arg_type = arg->getType();
-        llvm::Value* arg_val = arg;
-
-        if (cfg->params[arg_idx].ty == BINOPT_TY_PTR_NOALIAS) {
-            fn->addParamAttr(arg_idx, llvm::Attribute::NoAlias);
-        }
-
-        // Fix known parameters
-        if (const void* const_vptr = cfg->params[arg_idx].const_val) {
-            auto const_ptr = reinterpret_cast<const uint64_t*>(const_vptr);
-            size_t const_sz = arg_type->getPrimitiveSizeInBits();
-            if (arg_type->isPointerTy())
-                const_sz = sizeof(void*) * 8;
-            llvm::APInt const_val(const_sz, llvm::ArrayRef(const_ptr, const_sz/64));
-            arg_val = llvm::ConstantInt::get(ctx, const_val);
-        }
-
-        if (arg_type->isIntOrPtrTy()) {
-            if (gpRegOffset < 6) {
-                if (arg_type->isPointerTy())
-                    arg_val = irb.CreatePtrToInt(arg_val, irb.getInt64Ty());
-                else // arg_type->isIntegerTy()
-                    arg_val = irb.CreateZExtOrTrunc(arg_val, irb.getInt64Ty());
-
-                target = dbll_gep_helper(irb, alloca, {0, 1, gp_regs[gpRegOffset]});
-                irb.CreateStore(arg_val, target);
-                gpRegOffset++;
-            } else {
-                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
-                stackOffset += 8;
-            }
-        } else if (arg_type->isFloatTy() || arg_type->isDoubleTy()) {
-            if (fpRegOffset < 8) {
-                llvm::Type* int_type = irb.getIntNTy(arg_type->getPrimitiveSizeInBits());
-                llvm::Value* int_val = irb.CreateBitCast(arg_val, int_type);
-
-                target = dbll_gep_helper(irb, alloca, {0, 4, fpRegOffset});
-                llvm::Type* vec_type = target->getType()->getPointerElementType();
-                irb.CreateStore(irb.CreateZExt(int_val, vec_type), target);
-                fpRegOffset++;
-            } else {
-                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
-                stackOffset += 8;
-            }
-        } else {
-            return nullptr;
-        }
-    }
-
-    std::size_t stack_frame_size = 4096;
-    std::size_t stack_size = stack_frame_size + stackOffset;
-
-    llvm::Value* stack_sz_val = irb.getInt64(stack_size);
-    llvm::AllocaInst* stack = irb.CreateAlloca(irb.getInt8Ty(), stack_sz_val);
-    stack->setAlignment(16);
-    llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
-    llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
-    irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
-    // Construct bitcast here, to avoid strange things after inlining.
-    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
-    llvm::Value* ret_addr_slot = irb.CreateBitCast(sp_ptr, i64p);
-
-    for (const auto& [offset, value] : stack_slots) {
-        llvm::Value* ptr = irb.CreateGEP(sp_ptr, irb.getInt64(offset));
-        irb.CreateStore(value, irb.CreateBitCast(ptr, value->getType()->getPointerTo()));
-    }
-
-    llvm::Value* call_arg = irb.CreatePointerCast(alloca, irb.getInt8PtrTy());
-    llvm::CallInst* call = irb.CreateCall(orig_fn, {call_arg});
-
-    llvm::Type* ret_type = fn->getReturnType();
-    switch (ret_type->getTypeID())
-    {
-        llvm::Value* ret;
-
-        case llvm::Type::TypeID::VoidTyID:
-            irb.CreateRetVoid();
-            break;
-        case llvm::Type::TypeID::IntegerTyID:
-            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 1, 0}));
-            ret = irb.CreateTruncOrBitCast(ret, ret_type);
-            irb.CreateRet(ret);
-            break;
-        case llvm::Type::TypeID::PointerTyID:
-            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 1, 0}));
-            ret = irb.CreateIntToPtr(ret, ret_type);
-            irb.CreateRet(ret);
-            break;
-        case llvm::Type::TypeID::FloatTyID:
-        case llvm::Type::TypeID::DoubleTyID:
-            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 4, 0}));
-            ret = irb.CreateTrunc(ret, irb.getIntNTy(ret_type->getPrimitiveSizeInBits()));
-            ret = irb.CreateBitCast(ret, ret_type);
-            irb.CreateRet(ret);
-            break;
-        default:
-            assert(false);
-            break;
-    }
-
-    llvm::InlineFunctionInfo ifi;
-    llvm::InlineFunction(llvm::CallSite(call), ifi);
-
-    // Now, we replace all calls to the temporary tail function to our real tail
-    // function, which takes an extra parameter. The difference between
-    // tail_func and call_func is the following: For tail_func, we hook the
-    // return address of this function (that is in ret_addr_slot). For call_func
-    // we must hook the return address which was just stored on the fake stack.
-
-    llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
-    for (const llvm::Use& use : handle->rl_func_tail->uses()) {
-        llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
-        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
-    }
-    for (llvm::CallInst* inst : tmp_insts) {
-        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_slot};
-        auto* new_inst = llvm::CallInst::Create(handle->native_helper, args);
-        llvm::ReplaceInstWithInst(inst, new_inst);
-    }
-    tmp_insts.clear();
-
-    for (const llvm::Use& use : handle->rl_func_call->uses()) {
-        llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
-        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
-    }
-    for (llvm::CallInst* inst : tmp_insts) {
-        irb.SetInsertPoint(inst);
-        llvm::Value* sp_ptr = dbll_gep_helper(irb, alloca, {0, 1, 4});
-        sp_ptr = irb.CreateBitCast(sp_ptr, i64p->getPointerTo());
-        llvm::Value* ret_addr_ptr = irb.CreateLoad(i64p, sp_ptr);
-        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_ptr};
-        auto* new_inst = llvm::CallInst::Create(handle->native_helper, args);
-        llvm::ReplaceInstWithInst(inst, new_inst);
-    }
-    tmp_insts.clear();
-
-    return fn;
 }
 
 class StrictSptrAAResult : public llvm::AAResultBase<StrictSptrAAResult> {
@@ -674,41 +460,288 @@ static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Module* mod,
         fpm.addPass(ConstMemPropPass(cfg));
     });
     auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
+    // mpm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::AAEvaluator()));
 
     mpm.run(*mod, mam);
+    // mpm.run(*mod, mam);
 }
 
-BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
-    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
+namespace {
+
+class Optimizer {
+    BinoptCfgRef cfg;
+
+    llvm::LLVMContext& ctx;
+    llvm::Module* mod;
+    llvm::TargetMachine* tm;
+
+    LLConfig* rlcfg;
+
+    llvm::Function* rl_func_call;
+    llvm::Function* rl_func_tail;
+    llvm::Function* native_helper;
+
+    Optimizer(BinoptCfgRef cfg, llvm::Module* mod)
+            : cfg(cfg), ctx(mod->getContext()), mod(mod) {}
+    ~Optimizer();
+
+    bool Init();
+    llvm::Function* Lift(BinoptFunc func);
+    llvm::Function* Wrap(llvm::Function* orig_fn);
+
+public:
+    static BinoptFunc OptimizeFromConfig(BinoptCfgRef cfg);
+};
+
+Optimizer::~Optimizer() {
+    ll_config_free(rlcfg);
+}
+
+bool Optimizer::Init() {
+    std::string error;
+    std::string triple = llvm::sys::getProcessTriple();
+    auto* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target) {
+        if (cfg->log_level >= LogLevel::WARNING)
+            llvm::errs() << "could not select target: " << error << "\n";
+
+        return false;
+    }
 
     llvm::TargetOptions options;
     options.EnableFastISel = false;
+    tm = target->createTargetMachine(triple,
+                                     /*CPU=*/llvm::sys::getHostCPUName(),
+                                     /*Features=*/"-avx", options,
+                                     llvm::None, // llvm::Reloc::Default,
+                                     llvm::None, // llvm::CodeModel::JITDefault,
+                                     llvm::CodeGenOpt::Aggressive, /*JIT*/true);
 
-    llvm::Module* mod_ptr = handle->mod.get();
+    mod->setTargetTriple(triple);
 
-    std::string error;
-    llvm::EngineBuilder builder(std::move(handle->mod));
-    builder.setEngineKind(llvm::EngineKind::JIT);
-    builder.setErrorStr(&error);
-    builder.setOptLevel(llvm::CodeGenOpt::Aggressive);
-    builder.setTargetOptions(options);
+    llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
+    llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
+    auto helper_ty = llvm::FunctionType::get(void_ty, {i8p}, false);
+    auto linkage = llvm::GlobalValue::ExternalLinkage;
+    rl_func_call = llvm::Function::Create(helper_ty, linkage, "call_fn", mod);
+    rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn", mod);
+    native_helper = dbll_create_native_helper(mod);
 
-    // Same as "-mcpu=native", but disable AVX for the moment.
-    llvm::SmallVector<std::string, 1> MAttrs;
-    MAttrs.push_back(std::string("-avx"));
-    llvm::Triple triple = llvm::Triple(llvm::sys::getProcessTriple());
-    llvm::TargetMachine* target = builder.selectTarget(triple, "x86-64", llvm::sys::getHostCPUName(), MAttrs);
+    rlcfg = ll_config_new();
+    ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
+    ll_config_set_tail_func(rlcfg, llvm::wrap(rl_func_tail));
+    ll_config_set_call_func(rlcfg, llvm::wrap(rl_func_call));
 
-    llvm::Function* fn = dbll_lift_function(mod_ptr, cfg);
-    if (fn == nullptr) // in case something went wrong
-        return cfg->func;
+    return true;
+}
 
-    llvm::Function* wrapped_fn = dbll_wrap_function(cfg, fn);
-    fn->eraseFromParent(); // delete old function
-    fn = nullptr;
+llvm::Function* Optimizer::Lift(BinoptFunc func) {
+    LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
+    bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(func),
+                                   nullptr, nullptr);
+    if (fail) {
+        ll_func_dispose(rlfn);
+        return nullptr;
+    }
 
+    llvm::Value* fn_val = llvm::unwrap(ll_func_lift(rlfn));
+    ll_func_dispose(rlfn);
+
+    return llvm::cast_or_null<llvm::Function>(fn_val);
+}
+
+llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
+    llvm::FunctionType* fnty = dbll_map_function_type(cfg);
+    if (fnty == nullptr) // if we don't support the type
+        return nullptr;
+
+    // Create new function
+    llvm::LLVMContext& ctx = orig_fn->getContext();
+    auto linkage = llvm::GlobalValue::ExternalLinkage;
+    llvm::Function* fn = llvm::Function::Create(fnty, linkage, "glob",
+                                                orig_fn->getParent());
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "", fn);
+    llvm::IRBuilder<> irb(bb);
+
+    // Allocate CPU struct
+    llvm::Type* cpu_type = dbll_get_cpu_type(ctx);
+    llvm::AllocaInst* alloca = irb.CreateAlloca(cpu_type, int{0});
+    alloca->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {}));
+
+    // Set direction flag to zero
+    irb.CreateStore(irb.getFalse(), dbll_gep_helper(irb, alloca, {0, 2, 6}));
+
+    unsigned gp_regs[6] = { 7, 6, 2, 1, 8, 9 };
+    unsigned gpRegOffset = 0;
+    unsigned fpRegOffset = 0;
+    unsigned stackOffset = 8; // return address
+    llvm::SmallVector<std::pair<size_t, llvm::Value*>, 4> stack_slots;
+    llvm::Value* target;
+    unsigned arg_idx = 0;
+    for (auto arg = fn->arg_begin(); arg != fn->arg_end(); ++arg, ++arg_idx) {
+        llvm::Type* arg_type = arg->getType();
+        llvm::Value* arg_val = arg;
+
+        if (cfg->params[arg_idx].ty == BINOPT_TY_PTR_NOALIAS) {
+            fn->addParamAttr(arg_idx, llvm::Attribute::NoAlias);
+        }
+
+        // Fix known parameters
+        if (const void* const_vptr = cfg->params[arg_idx].const_val) {
+            auto const_ptr = reinterpret_cast<const uint64_t*>(const_vptr);
+            size_t const_sz = arg_type->getPrimitiveSizeInBits();
+            if (arg_type->isPointerTy())
+                const_sz = sizeof(void*) * 8;
+            llvm::APInt const_val(const_sz, llvm::ArrayRef(const_ptr, const_sz/64));
+            arg_val = llvm::ConstantInt::get(ctx, const_val);
+        }
+
+        if (arg_type->isIntOrPtrTy()) {
+            if (gpRegOffset < 6) {
+                if (arg_type->isPointerTy())
+                    arg_val = irb.CreatePtrToInt(arg_val, irb.getInt64Ty());
+                else // arg_type->isIntegerTy()
+                    arg_val = irb.CreateZExtOrTrunc(arg_val, irb.getInt64Ty());
+
+                target = dbll_gep_helper(irb, alloca, {0, 1, gp_regs[gpRegOffset]});
+                irb.CreateStore(arg_val, target);
+                gpRegOffset++;
+            } else {
+                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
+                stackOffset += 8;
+            }
+        } else if (arg_type->isFloatTy() || arg_type->isDoubleTy()) {
+            if (fpRegOffset < 8) {
+                llvm::Type* int_type = irb.getIntNTy(arg_type->getPrimitiveSizeInBits());
+                llvm::Value* int_val = irb.CreateBitCast(arg_val, int_type);
+
+                target = dbll_gep_helper(irb, alloca, {0, 4, fpRegOffset});
+                llvm::Type* vec_type = target->getType()->getPointerElementType();
+                irb.CreateStore(irb.CreateZExt(int_val, vec_type), target);
+                fpRegOffset++;
+            } else {
+                stack_slots.push_back(std::make_pair(stackOffset, arg_val));
+                stackOffset += 8;
+            }
+        } else {
+            return nullptr;
+        }
+    }
+
+    std::size_t stack_frame_size = 4096;
+    std::size_t stack_size = stack_frame_size + stackOffset;
+
+    llvm::Value* stack_sz_val = irb.getInt64(stack_size);
+    llvm::AllocaInst* stack = irb.CreateAlloca(irb.getInt8Ty(), stack_sz_val);
+    stack->setAlignment(16);
+    llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
+    llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
+    irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
+    // Construct bitcast here, to avoid strange things after inlining.
+    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
+    llvm::Value* ret_addr_slot = irb.CreateBitCast(sp_ptr, i64p);
+
+    for (const auto& [offset, value] : stack_slots) {
+        llvm::Value* ptr = irb.CreateGEP(sp_ptr, irb.getInt64(offset));
+        irb.CreateStore(value, irb.CreateBitCast(ptr, value->getType()->getPointerTo()));
+    }
+
+    llvm::Value* call_arg = irb.CreatePointerCast(alloca, irb.getInt8PtrTy());
+    llvm::CallInst* call = irb.CreateCall(orig_fn, {call_arg});
+
+    llvm::Type* ret_type = fn->getReturnType();
+    switch (ret_type->getTypeID())
+    {
+        llvm::Value* ret;
+
+        case llvm::Type::TypeID::VoidTyID:
+            irb.CreateRetVoid();
+            break;
+        case llvm::Type::TypeID::IntegerTyID:
+            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 1, 0}));
+            ret = irb.CreateTruncOrBitCast(ret, ret_type);
+            irb.CreateRet(ret);
+            break;
+        case llvm::Type::TypeID::PointerTyID:
+            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 1, 0}));
+            ret = irb.CreateIntToPtr(ret, ret_type);
+            irb.CreateRet(ret);
+            break;
+        case llvm::Type::TypeID::FloatTyID:
+        case llvm::Type::TypeID::DoubleTyID:
+            ret = irb.CreateLoad(dbll_gep_helper(irb, alloca, {0, 4, 0}));
+            ret = irb.CreateTrunc(ret, irb.getIntNTy(ret_type->getPrimitiveSizeInBits()));
+            ret = irb.CreateBitCast(ret, ret_type);
+            irb.CreateRet(ret);
+            break;
+        default:
+            assert(false);
+            break;
+    }
+
+    llvm::InlineFunctionInfo ifi;
+    llvm::InlineFunction(llvm::CallSite(call), ifi);
+
+    // Now, we replace all calls to the temporary tail function to our real tail
+    // function, which takes an extra parameter. The difference between
+    // tail_func and call_func is the following: For tail_func, we hook the
+    // return address of this function (that is in ret_addr_slot). For call_func
+    // we must hook the return address which was just stored on the fake stack.
+
+    llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
+    for (const llvm::Use& use : rl_func_tail->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
+        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+    }
+    for (llvm::CallInst* inst : tmp_insts) {
+        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_slot};
+        auto* new_inst = llvm::CallInst::Create(native_helper, args);
+        llvm::ReplaceInstWithInst(inst, new_inst);
+    }
+    tmp_insts.clear();
+
+    for (const llvm::Use& use : rl_func_call->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
+        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+    }
+    for (llvm::CallInst* inst : tmp_insts) {
+        irb.SetInsertPoint(inst);
+        llvm::Value* sp_ptr = dbll_gep_helper(irb, alloca, {0, 1, 4});
+        sp_ptr = irb.CreateBitCast(sp_ptr, i64p->getPointerTo());
+        llvm::Value* ret_addr_ptr = irb.CreateLoad(i64p, sp_ptr);
+        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_ptr};
+        auto* new_inst = llvm::CallInst::Create(native_helper, args);
+        llvm::ReplaceInstWithInst(inst, new_inst);
+    }
+    tmp_insts.clear();
+
+    return fn;
+}
+
+BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
+    DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
+    auto mod_u = std::make_unique<llvm::Module>("binopt", handle->ctx);
+    llvm::Module* mod = mod_u.get();
+
+    Optimizer opt(cfg, mod);
+    if (!opt.Init())
+        return nullptr;
+
+    llvm::Function* fn = opt.Lift(cfg->func);
+    if (!fn)
+        return nullptr;
+
+    if (cfg->log_level >= LogLevel::DEBUG)
+        mod->print(llvm::dbgs(), nullptr);
+
+    llvm::Function* wrapped_fn = opt.Wrap(fn);
     if (wrapped_fn == nullptr)
         return nullptr;
+
+    if (cfg->log_level >= LogLevel::DEBUG)
+        mod->print(llvm::dbgs(), nullptr);
 
     // This should only scream if our code has a bug.
     if (llvm::verifyFunction(*wrapped_fn, &llvm::errs())) {
@@ -717,18 +750,27 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     }
 
     // dbll_optimize_fast(wrapped_fn);
-    dbll_optimize_new_pm(cfg, mod_ptr, target);
+    dbll_optimize_new_pm(cfg, mod, opt.tm);
 
     if (cfg->log_level >= LogLevel::INFO)
-        mod_ptr->print(llvm::dbgs(), nullptr);
+        mod->print(llvm::dbgs(), nullptr);
 
-    llvm::ExecutionEngine* engine = builder.create(target);
+    llvm::EngineBuilder builder(std::move(mod_u));
+    llvm::ExecutionEngine* engine = builder.create(opt.tm);
     if (!engine)
         return cfg->func; // we could not create the JIT engine
 
     auto raw_ptr = engine->getFunctionAddress(wrapped_fn->getName());
 
     return reinterpret_cast<BinoptFunc>(raw_ptr);
+}
+
+}
+
+BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
+    if (BinoptFunc new_fn = Optimizer::OptimizeFromConfig(cfg))
+        return new_fn;
+    return cfg->func;
 }
 
 void binopt_spec_delete(BinoptHandle handle, BinoptFunc spec_func) {
