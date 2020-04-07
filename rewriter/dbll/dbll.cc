@@ -60,6 +60,7 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     auto linkage = llvm::GlobalValue::PrivateLinkage;
     llvm::Function* fn = llvm::Function::Create(fn_ty, linkage,
                                                 "dbll_native_helper", mod);
+    fn->addFnAttr(llvm::Attribute::AlwaysInline);
 
     llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "", fn);
     llvm::IRBuilder<> irb(bb);
@@ -76,22 +77,37 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     llvm::Value* stored_rip_ptr = &fn->arg_begin()[1];
     llvm::Value* orig_stored_rip = irb.CreateLoad(irb.getInt64Ty(), stored_rip_ptr);
 
-    llvm::SmallVector<llvm::Value*, 10> sptr_geps;
-    for (uint8_t idx : {4, 6, 9, 10, 11, 12, 13, 14, 15, 16})
-        sptr_geps.push_back(irb.CreateConstGEP1_64(sptr, idx));
+    llvm::SmallVector<llvm::Value*, 26> sptr_geps;
+    llvm::SmallVector<llvm::Value*, 32> asm_args;
+    llvm::SmallVector<llvm::Type*, 32> ty_list;
 
-    llvm::SmallVector<llvm::Value*, 16> asm_args;
     asm_args.push_back(irb.CreatePtrToInt(sptr, irb.getInt64Ty()));
     asm_args.push_back(irb.CreatePtrToInt(&fn->arg_begin()[1], irb.getInt64Ty()));
     asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), sptr)); // rip
     asm_args.push_back(irb.getInt64(0x202)); // rflags
     asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), irb.CreateConstGEP1_64(sptr, 5))); // rsp
-    for (llvm::Value* ptr : sptr_geps)
-        asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
-    asm_args.push_back(glob_slot);
+    for (unsigned i = 0; i < 5; i++)
+        ty_list.push_back(irb.getInt64Ty());
 
-    llvm::SmallVector<llvm::Type*, 16> ty_list(15, irb.getInt64Ty());
+    for (uint8_t idx : {4, 6, 9, 10, 11, 12, 13, 14, 15, 16}) {
+        sptr->getType()->getScalarType()->print(llvm::errs());
+        llvm::Value* ptr = irb.CreateConstGEP1_64(sptr, idx);
+        sptr_geps.push_back(ptr);
+        asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
+        ty_list.push_back(irb.getInt64Ty());
+    }
+    llvm::Type* sse_ty = llvm::VectorType::get(irb.getInt64Ty(), 2);//irb.getInt128Ty();//
+    llvm::Value* sptr128 = irb.CreateBitCast(sptr, sse_ty->getPointerTo());
+    for (uint8_t idx = 0; idx < 16; idx++) {
+        llvm::Value* ptr = irb.CreateConstGEP1_64(sse_ty, sptr128, 10 + idx, "xmmgep");
+        sptr_geps.push_back(ptr);
+        asm_args.push_back(irb.CreateLoad(sse_ty, ptr));
+        ty_list.push_back(sse_ty);
+    }
+
     auto asm_ret_ty = llvm::StructType::get(ctx, ty_list);
+
+    asm_args.push_back(glob_slot);
     ty_list.push_back(irb.getInt64Ty()->getPointerTo());
     auto asm_ty = llvm::FunctionType::get(asm_ret_ty, ty_list, false);
     // So, first we have: CPU state, ret_addr ptr, rip, rflags, rsp
@@ -99,7 +115,7 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     // TODO: we actually retain RDI, update constraints to reflect this.
     const auto constraints =
         "={di},={si},={ax},={cx},={dx},={bx},={bp},={r8},={r9},={r10},={r11},"
-        "={r12},={r13},={r14},={r15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,i";
+        "={r12},={r13},={r14},={r15},={xmm0},={xmm1},={xmm2},={xmm3},={xmm4},={xmm5},={xmm6},={xmm7},={xmm8},={xmm9},={xmm10},={xmm11},={xmm12},={xmm13},={xmm14},={xmm15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,i";
     const auto asm_code =
             "sub $$0x30, %rsp;"
             "mov %rax, 0x00(%rsp);" // user rip
@@ -111,7 +127,7 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
 
             // Store rsp in a safe place.
             // Fill return address in custom stack, so that the function returns to 1f
-            "movabs $30, %rax;"
+            "movabs $62, %rax;"
             "lea 1f(%rip), %rdx;"
             "mov %rsp, (%rax);"
             "mov %rdx, (%rsi);"
@@ -125,7 +141,7 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
 
             "iretq;" // isn't this cool? -- no, it isn't.
         "1:" // TODO: perhaps check rsp somehow?
-            "movabs $30, %rsp;" // throw away user rsp.
+            "movabs $62, %rsp;" // throw away user rsp.
             "mov (%rsp), %rsp;"
             "mov %rdi, (%rsp);" // temporarily store rdi on the stack
             "mov 0x28(%rsp), %rdi;" // rdi is now the CPU structure
