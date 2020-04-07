@@ -6,7 +6,9 @@
 
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/Analysis/AliasAnalysisEvaluator.h>
 #include <llvm/Analysis/ConstantFolding.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/InstIterator.h>
@@ -283,7 +285,8 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
 
     // Allocate CPU struct
     llvm::Type* cpu_type = dbll_get_cpu_type(ctx);
-    llvm::Value* alloca = irb.CreateAlloca(cpu_type, int{0});
+    llvm::AllocaInst* alloca = irb.CreateAlloca(cpu_type, int{0});
+    alloca->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {}));
 
     // Set direction flag to zero
     irb.CreateStore(irb.getFalse(), dbll_gep_helper(irb, alloca, {0, 2, 6}));
@@ -436,6 +439,51 @@ static llvm::Function* dbll_wrap_function(BinoptCfgRef cfg,
 
     return fn;
 }
+
+class StrictSptrAAResult : public llvm::AAResultBase<StrictSptrAAResult> {
+    friend llvm::AAResultBase<StrictSptrAAResult>;
+
+    const llvm::DataLayout &DL;
+public:
+    StrictSptrAAResult(const llvm::DataLayout &DL) : AAResultBase(), DL(DL) {}
+
+    llvm::AliasResult alias(const llvm::MemoryLocation &LocA, const llvm::MemoryLocation &LocB,
+                            llvm::AAQueryInfo &AAQI) {
+        if (!LocA.Ptr->getType()->isPointerTy() || !LocB.Ptr->getType()->isPointerTy())
+            return llvm::NoAlias;
+
+        bool is_sptr_a = false;
+        bool is_sptr_b = false;
+        const llvm::Value* u_a = llvm::GetUnderlyingObject(LocA.Ptr, DL);
+        const llvm::Value* u_b = llvm::GetUnderlyingObject(LocB.Ptr, DL);
+        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(u_a))
+            is_sptr_a = alloca->getMetadata("dbll.sptr") != nullptr;
+        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(u_b))
+            is_sptr_b = alloca->getMetadata("dbll.sptr") != nullptr;
+
+        if (is_sptr_a != is_sptr_b)
+            return llvm::NoAlias;
+        // unsigned as_a = LocA.Ptr->getType()->getPointerAddressSpace();
+        // unsigned as_b = LocB.Ptr->getType()->getPointerAddressSpace();
+
+        // if (as_a != as_b && (as_a == SPTR_ADDR_SPACE || as_b == SPTR_ADDR_SPACE))
+        //     return llvm::NoAlias;
+
+        return AAResultBase::alias(LocA, LocB, AAQI);
+    }
+};
+
+class StrictSptrAA : public llvm::AnalysisInfoMixin<StrictSptrAA> {
+    friend llvm::AnalysisInfoMixin<StrictSptrAA>;
+    static llvm::AnalysisKey Key;
+public:
+    using Result = StrictSptrAAResult;
+    StrictSptrAAResult run(llvm::Function& f, llvm::FunctionAnalysisManager& fam) {
+        return StrictSptrAAResult(f.getParent()->getDataLayout());
+    }
+};
+
+llvm::AnalysisKey StrictSptrAA::Key;
 
 class ConstMemPropPass : public llvm::PassInfoMixin<ConstMemPropPass> {
     BinoptCfgRef cfg;
@@ -592,7 +640,14 @@ static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Module* mod,
     llvm::ModuleAnalysisManager mam(false);
 
     // Register the AA manager
-    fam.registerPass([&] { return pb.buildDefaultAAPipeline(); });
+    fam.registerPass([&] {
+        llvm::AAManager aa;
+        aa.registerFunctionAnalysis<StrictSptrAA>();
+        aa.registerFunctionAnalysis<llvm::BasicAA>();
+        return aa;
+    });
+    fam.registerPass([&] { return StrictSptrAA(); });
+
     // Register analysis passes...
     pb.registerModuleAnalyses(mam);
     pb.registerCGSCCAnalyses(cgam);
