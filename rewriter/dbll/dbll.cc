@@ -77,82 +77,77 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     llvm::Value* stored_rip_ptr = &fn->arg_begin()[1];
     llvm::Value* orig_stored_rip = irb.CreateLoad(irb.getInt64Ty(), stored_rip_ptr);
 
-    llvm::SmallVector<llvm::Value*, 26> sptr_geps;
+    llvm::Value* sptr_rsp = irb.CreateConstGEP1_64(sptr, 5);
+
+    // Buffer area passed to inline asm.
+    // Contains: userrip, cs, userrflags, userrsp, ss
+    llvm::Value* asm_buf = irb.CreateAlloca(irb.getInt64Ty(), irb.getInt64(8));
+    irb.CreateStore(irb.CreateLoad(sptr), irb.CreateConstGEP1_64(asm_buf, 0));
+    irb.CreateStore(irb.getInt64(0x33), irb.CreateConstGEP1_64(asm_buf, 1));
+    // TODO: actually compute rflags?
+    irb.CreateStore(irb.getInt64(0x202), irb.CreateConstGEP1_64(asm_buf, 2));
+    irb.CreateStore(irb.CreateLoad(sptr_rsp), irb.CreateConstGEP1_64(asm_buf, 3));
+    irb.CreateStore(irb.getInt64(0x2b), irb.CreateConstGEP1_64(asm_buf, 4));
+
+    llvm::SmallVector<llvm::Value*, 31> sptr_geps;
     llvm::SmallVector<llvm::Value*, 32> asm_args;
-    llvm::SmallVector<llvm::Type*, 32> ty_list;
 
-    asm_args.push_back(irb.CreatePtrToInt(sptr, irb.getInt64Ty()));
-    asm_args.push_back(irb.CreatePtrToInt(&fn->arg_begin()[1], irb.getInt64Ty()));
-    asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), sptr)); // rip
-    asm_args.push_back(irb.getInt64(0x202)); // rflags
-    asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), irb.CreateConstGEP1_64(sptr, 5))); // rsp
-    for (unsigned i = 0; i < 5; i++)
-        ty_list.push_back(irb.getInt64Ty());
-
-    for (uint8_t idx : {4, 6, 9, 10, 11, 12, 13, 14, 15, 16}) {
-        sptr->getType()->getScalarType()->print(llvm::errs());
-        llvm::Value* ptr = irb.CreateConstGEP1_64(sptr, idx);
+    for (unsigned idx = 0; idx < 16; idx++) {
+        if (idx == 4)
+            continue; // Skip RSP
+        llvm::Value* ptr = irb.CreateConstGEP1_64(sptr, 1 + idx);
         sptr_geps.push_back(ptr);
         asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
-        ty_list.push_back(irb.getInt64Ty());
     }
-    llvm::Type* sse_ty = llvm::VectorType::get(irb.getInt64Ty(), 2);//irb.getInt128Ty();//
+    llvm::Type* sse_ty = llvm::VectorType::get(irb.getInt64Ty(), 2);
     llvm::Value* sptr128 = irb.CreateBitCast(sptr, sse_ty->getPointerTo());
     for (uint8_t idx = 0; idx < 16; idx++) {
         llvm::Value* ptr = irb.CreateConstGEP1_64(sse_ty, sptr128, 10 + idx, "xmmgep");
         sptr_geps.push_back(ptr);
         asm_args.push_back(irb.CreateLoad(sse_ty, ptr));
-        ty_list.push_back(sse_ty);
     }
 
-    auto asm_ret_ty = llvm::StructType::get(ctx, ty_list);
+    // First construct ty_list for the return type
+    llvm::SmallVector<llvm::Type*, 32> ty_list;
+    for (llvm::Value* arg : asm_args)
+        ty_list.push_back(arg->getType());
+
+    llvm::Type* asm_ret_ty = llvm::StructType::get(ctx, ty_list);
+
+    // Store RAX, RCX and RDX in asm_buf
+    irb.CreateStore(asm_args[0], irb.CreateConstGEP1_64(asm_buf, 5));
+    irb.CreateStore(asm_args[1], irb.CreateConstGEP1_64(asm_buf, 6));
+    irb.CreateStore(asm_args[2], irb.CreateConstGEP1_64(asm_buf, 7));
+    // RAX = asm_buf, RCX = stored_rip_ptr, RDX = glob_slot
+    asm_args[0] = asm_buf;
+    asm_args[1] = stored_rip_ptr;
+    asm_args[2] = glob_slot;
+    ty_list[0] = i64p;
+    ty_list[1] = i64p;
+    ty_list[2] = i64p;
 
     asm_args.push_back(glob_slot);
-    ty_list.push_back(irb.getInt64Ty()->getPointerTo());
+    ty_list.push_back(i64p);
+
     auto asm_ty = llvm::FunctionType::get(asm_ret_ty, ty_list, false);
-    // So, first we have: CPU state, ret_addr ptr, rip, rflags, rsp
-    // These are followed by the 10 remaining free registers.
-    // TODO: we actually retain RDI, update constraints to reflect this.
     const auto constraints =
-        "={di},={si},={ax},={cx},={dx},={bx},={bp},={r8},={r9},={r10},={r11},"
-        "={r12},={r13},={r14},={r15},={xmm0},={xmm1},={xmm2},={xmm3},={xmm4},={xmm5},={xmm6},={xmm7},={xmm8},={xmm9},={xmm10},={xmm11},={xmm12},={xmm13},={xmm14},={xmm15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,i";
+        "={ax},={cx},={dx},={bx},={bp},={si},={di},={r8},={r9},={r10},={r11},"
+        "={r12},={r13},={r14},={r15},={xmm0},={xmm1},={xmm2},={xmm3},={xmm4},"
+        "={xmm5},={xmm6},={xmm7},={xmm8},={xmm9},={xmm10},={xmm11},={xmm12},"
+        "={xmm13},={xmm14},={xmm15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,"
+        "17,18,19,20,21,22,23,24,25,26,27,28,29,30,i";
     const auto asm_code =
-            "sub $$0x30, %rsp;"
-            "mov %rax, 0x00(%rsp);" // user rip
-            "mov %cs, 0x08(%rsp);"
-            "mov %rcx, 0x10(%rsp);" // user rflags
-            "mov %rdx, 0x18(%rsp);" // user rsp
-            "mov %ss, 0x20(%rsp);"
-            "mov %rdi, 0x28(%rsp);" // Store CPU state (not for iretq)
-
-            // Store rsp in a safe place.
-            // Fill return address in custom stack, so that the function returns to 1f
-            "movabs $62, %rax;"
+            "mov %rsp, (%rdx);" // store rsp in glob_slot
             "lea 1f(%rip), %rdx;"
-            "mov %rsp, (%rax);"
-            "mov %rdx, (%rsi);"
-
-            // Set remaining registers do rdi last.
-            "mov 1*8(%rdi), %rax;"
-            "mov 2*8(%rdi), %rcx;"
-            "mov 3*8(%rdi), %rdx;"
-            "mov 7*8(%rdi), %rsi;"
-            "mov 8*8(%rdi), %rdi;"
-
+            "mov %rax, %rsp;"
+            "mov 0x28(%rsp), %rax;" // setup user rax
+            "mov %rdx, (%rcx);" // store return address in stored_rip_ptr
+            "mov 0x30(%rsp), %rcx;" // setup user rcx
+            "mov 0x38(%rsp), %rdx;" // setup user rdx
             "iretq;" // isn't this cool? -- no, it isn't.
         "1:" // TODO: perhaps check rsp somehow?
             "movabs $62, %rsp;" // throw away user rsp.
-            "mov (%rsp), %rsp;"
-            "mov %rdi, (%rsp);" // temporarily store rdi on the stack
-            "mov 0x28(%rsp), %rdi;" // rdi is now the CPU structure
-
-            "mov %rax, 1*8(%rdi);"
-            "mov (%rsp), %rax;"
-            "mov %rax, 8*8(%rdi);" // user rdi
-            "mov %rcx, 2*8(%rdi);"
-            "mov %rdx, 3*8(%rdi);"
-            "mov %rsi, 7*8(%rdi);"
-            "add $$0x30, %rsp;";
+            "mov (%rsp), %rsp;";
 
     auto asm_inst = llvm::InlineAsm::get(asm_ty, asm_code, constraints,
                                          /*hasSideEffects=*/true,
@@ -163,11 +158,10 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     // Move the RIP where the previous function returned to to the CPU state.
     irb.CreateStore(orig_stored_rip, sptr);
     for (unsigned i = 0; i < sptr_geps.size(); i++)
-        irb.CreateStore(irb.CreateExtractValue(asm_res, i + 5), sptr_geps[i]);
+        irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
 
     // Set user RSP to stored_rip_ptr + 8
-    llvm::Value* new_rsp = irb.CreateConstGEP1_64(stored_rip_ptr, 1);
-    irb.CreateStore(new_rsp, irb.CreateConstGEP1_64(sptr, 5));
+    irb.CreateStore(irb.CreateConstGEP1_64(stored_rip_ptr, 1), sptr_rsp);
 
     irb.CreateRetVoid();
 
