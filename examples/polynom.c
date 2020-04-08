@@ -19,8 +19,8 @@ int main(int argc, char** argv) {
 
     BinoptHandle boh = binopt_init();
     BinoptCfgRef bcfg = binopt_cfg_new(boh, (BinoptFunc) func);
-    binopt_cfg_type(bcfg, 2, BINOPT_TY_INT64, BINOPT_TY_PTR, BINOPT_TY_PTR);
-    int64_t poly[] = {3, 2, 1, 1};
+    binopt_cfg_type(bcfg, 2, BINOPT_TY_INT64, BINOPT_TY_PTR, BINOPT_TY_INT64);
+    int64_t poly[] = {3, 2, 1, 2};
     binopt_cfg_set_paramp(bcfg, 0, poly, sizeof(poly), BINOPT_MEM_CONST);
 
     int64_t (* new_func)(const int64_t*, int64_t);
@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
 
     poly[0] = 1;
     int64_t res = new_func(poly, 4);
-    printf("2(2+1*4^1+1*4^2) = %ld\n", res);
+    printf("2(2+1*4^1+2*4^2) = %ld\n", res);
 
     return 0;
 }
