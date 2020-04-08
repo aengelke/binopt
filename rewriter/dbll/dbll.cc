@@ -76,7 +76,6 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
     llvm::Value* sptr = irb.CreateBitCast(&fn->arg_begin()[0], i64p);
 
     llvm::Value* stored_rip_ptr = &fn->arg_begin()[1];
-    llvm::Value* orig_stored_rip = irb.CreateLoad(irb.getInt64Ty(), stored_rip_ptr);
 
     llvm::Value* sptr_rsp = irb.CreateConstGEP1_64(sptr, 5);
 
@@ -156,14 +155,10 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
                                          llvm::InlineAsm::AD_ATT);
     llvm::Value* asm_res = irb.CreateCall(asm_inst, asm_args);
 
-    // Move the RIP where the previous function returned to to the CPU state.
-    irb.CreateStore(orig_stored_rip, sptr);
+    // RIP and RSP are set outside of this function to allow for better
+    // optimizations for calls/jumps with known targets.
     for (unsigned i = 0; i < sptr_geps.size(); i++)
         irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
-
-    // Set user RSP to stored_rip_ptr + 8
-    llvm::Value* new_rsp = irb.CreateConstGEP1_64(stored_rip_ptr, 1);
-    irb.CreateStore(irb.CreatePtrToInt(new_rsp, irb.getInt64Ty()), sptr_rsp);
 
     irb.CreateRetVoid();
 
@@ -481,7 +476,6 @@ class Optimizer {
     llvm::Function* rl_func_call;
     llvm::Function* rl_func_tail;
     llvm::Function* func_helper_ext;
-    llvm::Function* native_helper;
 
     Optimizer(BinoptCfgRef cfg, llvm::Module* mod)
             : cfg(cfg), ctx(mod->getContext()), mod(mod) {}
@@ -535,8 +529,6 @@ bool Optimizer::Init() {
     auto helper_ext_ty = llvm::FunctionType::get(void_ty, {i8p, i64p, i64, i1}, false);
     func_helper_ext = llvm::Function::Create(helper_ext_ty, linkage,
                                              "ext_helper", mod);
-
-    native_helper = dbll_create_native_helper(mod);
 
     rlcfg = ll_config_new();
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
@@ -613,8 +605,19 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
             args[1] = entry_sp;
         args[2] = irb.CreateLoad(irb.getInt64Ty(), sptr_ip);
         args[3] = irb.getInt1(is_call ? 1 : 0);
-        auto* new_inst = llvm::CallInst::Create(func_helper_ext, args);
-        llvm::ReplaceInstWithInst(inst, new_inst);
+
+        llvm::Value* return_rip = irb.CreateLoad(irb.getInt64Ty(), args[1]);
+
+        irb.CreateCall(func_helper_ext, args);
+
+        // We have some information about ext_helper regarding RIP/RSP.
+        // Set RIP to the address which was just stored on the stack before.
+        irb.CreateStore(return_rip, sptr_ip);
+        // Set user RSP to stored_rip_ptr + 8
+        irb.CreateStore(irb.CreateConstGEP1_64(args[1], 1), sptr_sp);
+
+        // Remove call to rl_func_call/rl_func_tail.
+        inst->eraseFromParent();
     }
     tmp_insts.clear();
 
@@ -761,6 +764,8 @@ void Optimizer::LowerExternalCallToNative() {
     if (func_helper_ext->user_empty())
         return;
 
+    llvm::Function* native_helper = dbll_create_native_helper(mod);
+
     llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
     for (const llvm::Use& use : func_helper_ext->uses()) {
         llvm::CallSite cs(use.getUser());
@@ -775,6 +780,8 @@ void Optimizer::LowerExternalCallToNative() {
         llvm::InlineFunctionInfo ifi;
         llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
     }
+
+    native_helper->removeFromParent();
 }
 
 BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
