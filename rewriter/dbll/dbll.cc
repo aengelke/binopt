@@ -25,6 +25,8 @@
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/EarlyCSE.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/Local.h>
@@ -488,6 +490,8 @@ class Optimizer {
     llvm::Function* Wrap(llvm::Function* orig_fn);
     void LowerExternalCallToNative();
 
+    static void OptimizeLight(llvm::Function* fn);
+
 public:
     static BinoptFunc OptimizeFromConfig(BinoptCfgRef cfg);
 };
@@ -636,6 +640,8 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     assert(rl_func_tail->user_empty() && "rl_func_tail has uses (after)");
     assert(rl_func_call->user_empty() && "rl_func_call has uses (after)");
 
+    OptimizeLight(fn);
+
     return fn;
 }
 
@@ -768,6 +774,8 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::InlineFunctionInfo ifi;
     llvm::InlineFunction(llvm::CallSite(call), ifi);
 
+    OptimizeLight(fn);
+
     return fn;
 }
 
@@ -793,6 +801,41 @@ void Optimizer::LowerExternalCallToNative() {
     }
 
     native_helper->removeFromParent();
+}
+
+void Optimizer::OptimizeLight(llvm::Function* fn) {
+    // Do some very simple optimizations, so that calls to ext_helper are
+    // simplified that a constant target RIP is propagated and subsequent
+    // branches based on the RIP value are eliminated.
+
+    llvm::PassBuilder pb;
+    llvm::FunctionPassManager fpm(false);
+
+    llvm::LoopAnalysisManager lam(false);
+    llvm::FunctionAnalysisManager fam(false);
+    llvm::CGSCCAnalysisManager cgam(false);
+    llvm::ModuleAnalysisManager mam(false);
+
+    fam.registerPass([&] {
+        llvm::AAManager aa;
+        aa.registerFunctionAnalysis<StrictSptrAA>();
+        aa.registerFunctionAnalysis<llvm::BasicAA>();
+        return aa;
+    });
+    fam.registerPass([&] { return StrictSptrAA(); });
+
+    // Register analysis passes...
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    fpm.addPass(llvm::EarlyCSEPass(true));
+    fpm.addPass(llvm::InstCombinePass(false));
+    fpm.addPass(llvm::SimplifyCFGPass());
+    fpm.addPass(llvm::AAEvaluator());
+    fpm.run(*fn, fam);
 }
 
 BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
