@@ -248,24 +248,26 @@ public:
         if (!LocA.Ptr->getType()->isPointerTy() || !LocB.Ptr->getType()->isPointerTy())
             return llvm::NoAlias;
 
-        bool is_sptr_a = false;
-        bool is_sptr_b = false;
-        const llvm::Value* u_a = llvm::GetUnderlyingObject(LocA.Ptr, DL);
-        const llvm::Value* u_b = llvm::GetUnderlyingObject(LocB.Ptr, DL);
-        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(u_a))
-            is_sptr_a = alloca->getMetadata("dbll.sptr") != nullptr;
-        if (auto* alloca = llvm::dyn_cast<llvm::AllocaInst>(u_b))
-            is_sptr_b = alloca->getMetadata("dbll.sptr") != nullptr;
-
-        if (is_sptr_a != is_sptr_b)
+        if (IsSptr(LocA.Ptr) != IsSptr(LocB.Ptr))
             return llvm::NoAlias;
-        // unsigned as_a = LocA.Ptr->getType()->getPointerAddressSpace();
-        // unsigned as_b = LocB.Ptr->getType()->getPointerAddressSpace();
-
-        // if (as_a != as_b && (as_a == SPTR_ADDR_SPACE || as_b == SPTR_ADDR_SPACE))
-        //     return llvm::NoAlias;
 
         return AAResultBase::alias(LocA, LocB, AAQI);
+    }
+
+private:
+    bool IsSptr(const llvm::Value* val) {
+        const llvm::Value* underlying = llvm::GetUnderlyingObject(val, DL);
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(underlying))
+            return inst->getMetadata("dbll.sptr") != nullptr;
+        if (auto* arg = llvm::dyn_cast<llvm::Argument>(underlying)) {
+            if (auto* md = arg->getParent()->getMetadata("dbll.sptr")) {
+                llvm::Metadata* idx_md = md->getOperand(0);
+                auto* idx_mdc = llvm::cast<llvm::ConstantAsMetadata>(idx_md);
+                auto idx = idx_mdc->getValue()->getUniqueInteger().getLimitedValue();
+                return arg->getArgNo() == idx;
+            }
+        }
+        return false;
     }
 };
 
@@ -560,6 +562,12 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     llvm::Function* fn = llvm::cast<llvm::Function>(fn_val);
     fn->setLinkage(llvm::GlobalValue::PrivateLinkage);
 
+    llvm::IRBuilder<> irb(fn->getEntryBlock().getFirstNonPHI());
+
+    // Argument index
+    llvm::Metadata* sptr_md = llvm::ConstantAsMetadata::get(irb.getInt32(0));
+    fn->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {sptr_md}));
+
     // fn has the signature void(i8* sptr), and may contain calls to
     // rl_func_call and rl_func_tail. First, we replace these helper functions
     // with other helper functions which additionally contain parameters for RIP
@@ -583,8 +591,6 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
         llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
         tmp_insts.push_back(std::make_pair(call, true));
     }
-
-    llvm::IRBuilder<> irb(fn->getEntryBlock().getFirstNonPHI());
 
     llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
     llvm::Value* sptr = &fn->arg_begin()[0];
