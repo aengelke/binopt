@@ -162,7 +162,8 @@ static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
         irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
 
     // Set user RSP to stored_rip_ptr + 8
-    irb.CreateStore(irb.CreateConstGEP1_64(stored_rip_ptr, 1), sptr_rsp);
+    llvm::Value* new_rsp = irb.CreateConstGEP1_64(stored_rip_ptr, 1);
+    irb.CreateStore(irb.CreatePtrToInt(new_rsp, irb.getInt64Ty()), sptr_rsp);
 
     irb.CreateRetVoid();
 
