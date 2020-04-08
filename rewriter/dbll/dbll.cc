@@ -4,6 +4,7 @@
 
 #include <rellume/rellume.h>
 
+#include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysisEvaluator.h>
@@ -481,6 +482,8 @@ class Optimizer {
     llvm::Function* rl_func_tail;
     llvm::Function* func_helper_ext;
 
+    llvm::DenseMap<BinoptFunc, llvm::Function*> lifted_fns;
+
     Optimizer(BinoptCfgRef cfg, llvm::Module* mod)
             : cfg(cfg), ctx(mod->getContext()), mod(mod) {}
     ~Optimizer();
@@ -545,6 +548,10 @@ bool Optimizer::Init() {
 }
 
 llvm::Function* Optimizer::Lift(BinoptFunc func) {
+    const auto& lifted_fns_iter = lifted_fns.find(func);
+    if (lifted_fns_iter != lifted_fns.end())
+        return lifted_fns_iter->second;
+
     // Note: rl_func_call/rl_func_tail must have no uses before this function.
     assert(rl_func_tail->user_empty() && "rl_func_tail has uses (before)");
     assert(rl_func_call->user_empty() && "rl_func_call has uses (before)");
@@ -641,6 +648,8 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     assert(rl_func_call->user_empty() && "rl_func_call has uses (after)");
 
     OptimizeLight(fn);
+
+    lifted_fns[func] = fn;
 
     return fn;
 }
@@ -860,6 +869,38 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
 
     if (cfg->log_level >= LogLevel::DEBUG)
         mod->print(llvm::dbgs(), nullptr);
+
+    // Try to iteratively discover called functions and lift them as well.
+    bool changed = true;
+    llvm::SmallVector<std::pair<uint64_t, llvm::CallInst*>, 8> ext_call_queue;
+    while (changed) {
+        changed = false;
+        for (const llvm::Use& use : opt.func_helper_ext->uses()) {
+            llvm::CallSite cs(use.getUser());
+            assert(cs && cs.isCallee(&use) && "strange reference to ext_helper");
+            llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
+            if (auto c = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
+                uint64_t addr = c->getUniqueInteger().getLimitedValue();
+                ext_call_queue.push_back(std::make_pair(addr, call));
+            }
+        }
+
+        for (auto [addr, inst] : ext_call_queue) {
+            llvm::Function* fn = opt.Lift(reinterpret_cast<BinoptFunc>(addr));
+            auto is_call = llvm::dyn_cast<llvm::Constant>(inst->getArgOperand(3));
+            auto* new_inst = llvm::CallInst::Create(fn, {inst->getArgOperand(0)});
+            llvm::ReplaceInstWithInst(inst, new_inst);
+
+            // Directly inline tail functions
+            if (is_call && is_call->isZeroValue()) {
+                llvm::InlineFunctionInfo ifi;
+                llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
+            }
+        }
+
+        changed = !ext_call_queue.empty();
+        ext_call_queue.clear();
+    }
 
     opt.LowerExternalCallToNative();
 
