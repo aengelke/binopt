@@ -592,12 +592,16 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
         tmp_insts.push_back(std::make_pair(call, true));
     }
 
-    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
+    llvm::Type* i64 = irb.getInt64Ty();
+    llvm::Type* i64p = i64->getPointerTo();
     llvm::Value* sptr = &fn->arg_begin()[0];
     llvm::Value* sptr_ip = irb.CreateBitCast(sptr, i64p);
+    // Note: we first do the GEP and then cast. EarlyCSE is not very clever in
+    // reasoning about where a GEP leads to. For the same reason, use ptrtoint
+    // instead of casting to an i64**.
     llvm::Value* sptr_sp_i8p = irb.CreateConstGEP1_64(sptr, 5 * 8);
-    llvm::Value* sptr_sp = irb.CreateBitCast(sptr_sp_i8p, i64p->getPointerTo());
-    llvm::Value* entry_sp = irb.CreateLoad(i64p, sptr_sp);
+    llvm::Value* sptr_sp = irb.CreateBitCast(sptr_sp_i8p, i64p);
+    llvm::Value* entry_sp = irb.CreateIntToPtr(irb.CreateLoad(i64, sptr_sp), i64p);
 
     llvm::Value* args[4];
     for (auto [inst, is_call] : tmp_insts) {
@@ -606,7 +610,7 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
         assert(inst->getArgOperand(0) == sptr && "multiple sptrs");
         args[0] = sptr;
         if (is_call)
-            args[1] = irb.CreateLoad(i64p, sptr_sp);
+            args[1] = irb.CreateIntToPtr(irb.CreateLoad(i64, sptr_sp), i64p);
         else
             args[1] = entry_sp;
         args[2] = irb.CreateLoad(irb.getInt64Ty(), sptr_ip);
@@ -620,7 +624,8 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
         // Set RIP to the address which was just stored on the stack before.
         irb.CreateStore(return_rip, sptr_ip);
         // Set user RSP to stored_rip_ptr + 8
-        irb.CreateStore(irb.CreateConstGEP1_64(args[1], 1), sptr_sp);
+        llvm::Value* new_sp = irb.CreateConstGEP1_64(args[1], 1);
+        irb.CreateStore(irb.CreatePtrToInt(new_sp, i64), sptr_sp);
 
         // Remove call to rl_func_call/rl_func_tail.
         inst->eraseFromParent();
