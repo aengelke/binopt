@@ -480,6 +480,7 @@ class Optimizer {
 
     llvm::Function* rl_func_call;
     llvm::Function* rl_func_tail;
+    llvm::Function* func_helper_ext;
     llvm::Function* native_helper;
 
     Optimizer(BinoptCfgRef cfg, llvm::Module* mod)
@@ -489,6 +490,7 @@ class Optimizer {
     bool Init();
     llvm::Function* Lift(BinoptFunc func);
     llvm::Function* Wrap(llvm::Function* orig_fn);
+    void LowerExternalCallToNative();
 
 public:
     static BinoptFunc OptimizeFromConfig(BinoptCfgRef cfg);
@@ -520,12 +522,20 @@ bool Optimizer::Init() {
 
     mod->setTargetTriple(triple);
 
+    llvm::Type* i1 = llvm::Type::getInt1Ty(ctx);
+    llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
     llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
+    llvm::Type* i64p = i64->getPointerTo();
     llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
     auto helper_ty = llvm::FunctionType::get(void_ty, {i8p}, false);
     auto linkage = llvm::GlobalValue::ExternalLinkage;
     rl_func_call = llvm::Function::Create(helper_ty, linkage, "call_fn", mod);
     rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn", mod);
+    // This is void(i8* sptr, i64* retaddr_ptr, i64 rip, i1 is_call)
+    auto helper_ext_ty = llvm::FunctionType::get(void_ty, {i8p, i64p, i64, i1}, false);
+    func_helper_ext = llvm::Function::Create(helper_ext_ty, linkage,
+                                             "ext_helper", mod);
+
     native_helper = dbll_create_native_helper(mod);
 
     rlcfg = ll_config_new();
@@ -537,6 +547,10 @@ bool Optimizer::Init() {
 }
 
 llvm::Function* Optimizer::Lift(BinoptFunc func) {
+    // Note: rl_func_call/rl_func_tail must have no uses before this function.
+    assert(rl_func_tail->user_empty() && "rl_func_tail has uses (before)");
+    assert(rl_func_call->user_empty() && "rl_func_call has uses (before)");
+
     LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
     bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(func),
                                    nullptr, nullptr);
@@ -548,7 +562,67 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     llvm::Value* fn_val = llvm::unwrap(ll_func_lift(rlfn));
     ll_func_dispose(rlfn);
 
-    return llvm::cast_or_null<llvm::Function>(fn_val);
+    if (!fn_val)
+        return nullptr;
+
+    llvm::Function* fn = llvm::cast<llvm::Function>(fn_val);
+    fn->setLinkage(llvm::GlobalValue::PrivateLinkage);
+
+    // fn has the signature void(i8* sptr), and may contain calls to
+    // rl_func_call and rl_func_tail. First, we replace these helper functions
+    // with other helper functions which additionally contain parameters for RIP
+    // and a pointer to the (user) return address, so that constant propagation
+    // will eventually give us a constant RIP.
+    //
+    // The difference between tail_func and call_func is the following: For
+    // tail_func, we hook the return address of this function. For call_func we
+    // must hook the return address which was just stored on the fake stack.
+
+    llvm::SmallVector<std::pair<llvm::CallInst*, bool>, 8> tmp_insts;
+    for (const llvm::Use& use : rl_func_tail->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
+        llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
+        tmp_insts.push_back(std::make_pair(call, false));
+    }
+    for (const llvm::Use& use : rl_func_call->uses()) {
+        llvm::CallSite cs(use.getUser());
+        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
+        llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
+        tmp_insts.push_back(std::make_pair(call, true));
+    }
+
+    llvm::IRBuilder<> irb(fn->getEntryBlock().getFirstNonPHI());
+
+    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
+    llvm::Value* sptr = &fn->arg_begin()[0];
+    llvm::Value* sptr_ip = irb.CreateBitCast(sptr, i64p);
+    llvm::Value* sptr_sp_i8p = irb.CreateConstGEP1_64(sptr, 5 * 8);
+    llvm::Value* sptr_sp = irb.CreateBitCast(sptr_sp_i8p, i64p->getPointerTo());
+    llvm::Value* entry_sp = irb.CreateLoad(i64p, sptr_sp);
+
+    llvm::Value* args[4];
+    for (auto [inst, is_call] : tmp_insts) {
+        irb.SetInsertPoint(inst);
+
+        assert(inst->getArgOperand(0) == sptr && "multiple sptrs");
+        args[0] = sptr;
+        if (is_call)
+            args[1] = irb.CreateLoad(i64p, sptr_sp);
+        else
+            args[1] = entry_sp;
+        args[2] = irb.CreateLoad(irb.getInt64Ty(), sptr_ip);
+        args[3] = irb.getInt1(is_call ? 1 : 0);
+        auto* new_inst = llvm::CallInst::Create(func_helper_ext, args);
+        llvm::ReplaceInstWithInst(inst, new_inst);
+    }
+    tmp_insts.clear();
+
+    // Note: rl_func_call/rl_func_tail must have no uses after this function.
+    assert(rl_func_tail->user_empty() && "rl_func_tail has uses (after)");
+    assert(rl_func_call->user_empty() && "rl_func_call has uses (after)");
+
+    return fn;
 }
 
 llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
@@ -638,9 +712,6 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
     llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
     irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
-    // Construct bitcast here, to avoid strange things after inlining.
-    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
-    llvm::Value* ret_addr_slot = irb.CreateBitCast(sp_ptr, i64p);
 
     for (const auto& [offset, value] : stack_slots) {
         llvm::Value* ptr = irb.CreateGEP(sp_ptr, irb.getInt64(offset));
@@ -683,42 +754,27 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::InlineFunctionInfo ifi;
     llvm::InlineFunction(llvm::CallSite(call), ifi);
 
-    // Now, we replace all calls to the temporary tail function to our real tail
-    // function, which takes an extra parameter. The difference between
-    // tail_func and call_func is the following: For tail_func, we hook the
-    // return address of this function (that is in ret_addr_slot). For call_func
-    // we must hook the return address which was just stored on the fake stack.
+    return fn;
+}
+
+void Optimizer::LowerExternalCallToNative() {
+    if (func_helper_ext->user_empty())
+        return;
 
     llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
-    for (const llvm::Use& use : rl_func_tail->uses()) {
+    for (const llvm::Use& use : func_helper_ext->uses()) {
         llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
+        assert(cs && cs.isCallee(&use) && "strange reference to helper_ext");
         tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
     }
     for (llvm::CallInst* inst : tmp_insts) {
-        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_slot};
+        llvm::Value* args[2] = {inst->getArgOperand(0), inst->getArgOperand(1)};
         auto* new_inst = llvm::CallInst::Create(native_helper, args);
         llvm::ReplaceInstWithInst(inst, new_inst);
-    }
-    tmp_insts.clear();
 
-    for (const llvm::Use& use : rl_func_call->uses()) {
-        llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
-        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+        llvm::InlineFunctionInfo ifi;
+        llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
     }
-    for (llvm::CallInst* inst : tmp_insts) {
-        irb.SetInsertPoint(inst);
-        llvm::Value* sp_ptr = dbll_gep_helper(irb, alloca, {0, 1, 4});
-        sp_ptr = irb.CreateBitCast(sp_ptr, i64p->getPointerTo());
-        llvm::Value* ret_addr_ptr = irb.CreateLoad(i64p, sp_ptr);
-        llvm::Value* args[2] = {inst->getArgOperand(0), ret_addr_ptr};
-        auto* new_inst = llvm::CallInst::Create(native_helper, args);
-        llvm::ReplaceInstWithInst(inst, new_inst);
-    }
-    tmp_insts.clear();
-
-    return fn;
 }
 
 BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
@@ -740,6 +796,11 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
     llvm::Function* wrapped_fn = opt.Wrap(fn);
     if (wrapped_fn == nullptr)
         return nullptr;
+
+    if (cfg->log_level >= LogLevel::DEBUG)
+        mod->print(llvm::dbgs(), nullptr);
+
+    opt.LowerExternalCallToNative();
 
     if (cfg->log_level >= LogLevel::DEBUG)
         mod->print(llvm::dbgs(), nullptr);
