@@ -541,6 +541,9 @@ bool Optimizer::Init() {
 
     rlcfg = ll_config_new();
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
+    ll_config_set_call_ret_clobber_flags(rlcfg, true);
+    ll_config_set_use_native_segment_base(rlcfg, true);
+    ll_config_enable_full_facets(rlcfg, true);
     ll_config_set_tail_func(rlcfg, llvm::wrap(rl_func_tail));
     ll_config_set_call_func(rlcfg, llvm::wrap(rl_func_call));
 
@@ -671,6 +674,7 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::Type* cpu_type = dbll_get_cpu_type(ctx);
     llvm::AllocaInst* alloca = irb.CreateAlloca(cpu_type, int{0});
     alloca->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {}));
+    alloca->setAlignment(16);
 
     // Set direction flag to zero
     irb.CreateStore(irb.getFalse(), dbll_gep_helper(irb, alloca, {0, 2, 6}));
@@ -843,7 +847,7 @@ void Optimizer::OptimizeLight(llvm::Function* fn) {
     fpm.addPass(llvm::EarlyCSEPass(true));
     fpm.addPass(llvm::InstCombinePass(false));
     fpm.addPass(llvm::SimplifyCFGPass());
-    fpm.addPass(llvm::AAEvaluator());
+    // fpm.addPass(llvm::AAEvaluator());
     fpm.run(*fn, fam);
 }
 
