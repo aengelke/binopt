@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <iostream>
+#include <sstream>
 
 /* DBLL based on LLVM+Rellume, using default configuration API */
 
@@ -345,12 +346,6 @@ private:
 
         uint64_t addr_val = ConstantValue(addr).trunc(64).getLimitedValue();
 
-        if (cfg->log_level >= LogLevel::DEBUG) {
-            std::cerr << "folding load: ";
-            load->print(llvm::errs());
-            std::cerr << " to 0x" << std::hex << addr_val << "\n";
-        }
-
         if (!addr_val)
             return nullptr;
 
@@ -372,9 +367,11 @@ private:
             const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
 
         if (cfg->log_level >= LogLevel::DEBUG) {
-            std::cerr << "folded to: ";
-            const_val->print(llvm::errs());
-            std::cerr << "\n";
+            llvm::dbgs() << "folding load ";
+            load->print(llvm::dbgs());
+            llvm::dbgs() << " from " << llvm::format("%p", addr_val) << " to ";
+            const_val->print(llvm::dbgs());
+            llvm::dbgs() << "\n";
         }
 
         return const_val;
@@ -575,6 +572,10 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
 
     llvm::Function* fn = llvm::cast<llvm::Function>(fn_val);
     fn->setLinkage(llvm::GlobalValue::PrivateLinkage);
+
+    std::stringstream fname;
+    fname << "lift_" << std::hex << reinterpret_cast<uintptr_t>(func);
+    fn->setName(fname.str());
 
     llvm::IRBuilder<> irb(fn->getEntryBlock().getFirstNonPHI());
 
