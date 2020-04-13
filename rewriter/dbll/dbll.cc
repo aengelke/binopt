@@ -737,7 +737,7 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
         }
     }
 
-    std::size_t stack_frame_size = 4096;
+    std::size_t stack_frame_size = 4096 - 8;
     std::size_t stack_size = stack_frame_size + stackOffset;
 
     llvm::Value* stack_sz_val = irb.getInt64(stack_size);
@@ -939,6 +939,10 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
 BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     if (BinoptFunc new_fn = Optimizer::OptimizeFromConfig(cfg))
         return new_fn;
+
+    if (cfg->log_level >= LogLevel::WARNING)
+        llvm::errs() << "warning: returning old function\n";
+
     return cfg->func;
 }
 
