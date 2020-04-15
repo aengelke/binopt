@@ -3,6 +3,8 @@
 #include "binopt-config.h"
 
 #include "ConstMemProp.h"
+#include "LowerNativeCall.h"
+#include "PtrToIntFold.h"
 
 #include <rellume/rellume.h>
 
@@ -10,14 +12,11 @@
 #include <llvm/ADT/SmallPtrSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysisEvaluator.h>
-#include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Analysis/ValueTracking.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
 #include <llvm/IR/Function.h>
-#include <llvm/IR/InstIterator.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/InlineAsm.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -32,7 +31,6 @@
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Transforms/Utils/Cloning.h>
-#include <llvm/Transforms/Utils/Local.h>
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -57,119 +55,6 @@ const char* binopt_driver(void) {
     return "DBLL";
 }
 
-static llvm::Function* dbll_create_native_helper(llvm::Module* mod) {
-    llvm::LLVMContext& ctx = mod->getContext();
-
-    llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
-    llvm::Type* i64p = llvm::Type::getInt64Ty(ctx)->getPointerTo();
-    llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
-    auto fn_ty = llvm::FunctionType::get(void_ty, {i8p, i64p}, false);
-    auto linkage = llvm::GlobalValue::PrivateLinkage;
-    llvm::Function* fn = llvm::Function::Create(fn_ty, linkage,
-                                                "dbll_native_helper", mod);
-    fn->addFnAttr(llvm::Attribute::AlwaysInline);
-
-    llvm::BasicBlock* bb = llvm::BasicBlock::Create(ctx, "", fn);
-    llvm::IRBuilder<> irb(bb);
-
-    // We need some memory space addressable without any(!) registers except for
-    // rip where we can store the stack pointer. As the LLVM MCJIT doesn's
-    // implement thread-local storage, we opt for a global variable.
-    llvm::GlobalValue* glob_slot = new llvm::GlobalVariable(*mod,
-                irb.getInt64Ty(), false, llvm::GlobalValue::PrivateLinkage,
-                irb.getInt64(0), "dbll_native_helper_rsp");
-
-    llvm::Value* sptr = irb.CreateBitCast(&fn->arg_begin()[0], i64p);
-
-    llvm::Value* stored_rip_ptr = &fn->arg_begin()[1];
-
-    llvm::Value* sptr_rsp = irb.CreateConstGEP1_64(sptr, 5);
-
-    // Buffer area passed to inline asm.
-    // Contains: userrip, cs, userrflags, userrsp, ss
-    llvm::Value* asm_buf = irb.CreateAlloca(irb.getInt64Ty(), irb.getInt64(8));
-    irb.CreateStore(irb.CreateLoad(sptr), irb.CreateConstGEP1_64(asm_buf, 0));
-    irb.CreateStore(irb.getInt64(0x33), irb.CreateConstGEP1_64(asm_buf, 1));
-    // TODO: actually compute rflags?
-    irb.CreateStore(irb.getInt64(0x202), irb.CreateConstGEP1_64(asm_buf, 2));
-    irb.CreateStore(irb.CreateLoad(sptr_rsp), irb.CreateConstGEP1_64(asm_buf, 3));
-    irb.CreateStore(irb.getInt64(0x2b), irb.CreateConstGEP1_64(asm_buf, 4));
-
-    llvm::SmallVector<llvm::Value*, 31> sptr_geps;
-    llvm::SmallVector<llvm::Value*, 32> asm_args;
-
-    for (unsigned idx = 0; idx < 16; idx++) {
-        if (idx == 4)
-            continue; // Skip RSP
-        llvm::Value* ptr = irb.CreateConstGEP1_64(sptr, 1 + idx);
-        sptr_geps.push_back(ptr);
-        asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
-    }
-    llvm::Type* sse_ty = llvm::VectorType::get(irb.getInt64Ty(), 2);
-    llvm::Value* sptr128 = irb.CreateBitCast(sptr, sse_ty->getPointerTo());
-    for (uint8_t idx = 0; idx < 16; idx++) {
-        llvm::Value* ptr = irb.CreateConstGEP1_64(sse_ty, sptr128, 10 + idx, "xmmgep");
-        sptr_geps.push_back(ptr);
-        asm_args.push_back(irb.CreateLoad(sse_ty, ptr));
-    }
-
-    // First construct ty_list for the return type
-    llvm::SmallVector<llvm::Type*, 32> ty_list;
-    for (llvm::Value* arg : asm_args)
-        ty_list.push_back(arg->getType());
-
-    llvm::Type* asm_ret_ty = llvm::StructType::get(ctx, ty_list);
-
-    // Store RAX, RCX and RDX in asm_buf
-    irb.CreateStore(asm_args[0], irb.CreateConstGEP1_64(asm_buf, 5));
-    irb.CreateStore(asm_args[1], irb.CreateConstGEP1_64(asm_buf, 6));
-    irb.CreateStore(asm_args[2], irb.CreateConstGEP1_64(asm_buf, 7));
-    // RAX = asm_buf, RCX = stored_rip_ptr, RDX = glob_slot
-    asm_args[0] = asm_buf;
-    asm_args[1] = stored_rip_ptr;
-    asm_args[2] = glob_slot;
-    ty_list[0] = i64p;
-    ty_list[1] = i64p;
-    ty_list[2] = i64p;
-
-    asm_args.push_back(glob_slot);
-    ty_list.push_back(i64p);
-
-    auto asm_ty = llvm::FunctionType::get(asm_ret_ty, ty_list, false);
-    const auto constraints =
-        "={ax},={cx},={dx},={bx},={bp},={si},={di},={r8},={r9},={r10},={r11},"
-        "={r12},={r13},={r14},={r15},={xmm0},={xmm1},={xmm2},={xmm3},={xmm4},"
-        "={xmm5},={xmm6},={xmm7},={xmm8},={xmm9},={xmm10},={xmm11},={xmm12},"
-        "={xmm13},={xmm14},={xmm15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,"
-        "17,18,19,20,21,22,23,24,25,26,27,28,29,30,i";
-    const auto asm_code =
-            "mov %rsp, (%rdx);" // store rsp in glob_slot
-            "lea 1f(%rip), %rdx;"
-            "mov %rax, %rsp;"
-            "mov 0x28(%rsp), %rax;" // setup user rax
-            "mov %rdx, (%rcx);" // store return address in stored_rip_ptr
-            "mov 0x30(%rsp), %rcx;" // setup user rcx
-            "mov 0x38(%rsp), %rdx;" // setup user rdx
-            "iretq;" // isn't this cool? -- no, it isn't.
-        "1:" // TODO: perhaps check rsp somehow?
-            "movabs $62, %rsp;" // throw away user rsp.
-            "mov (%rsp), %rsp;";
-
-    auto asm_inst = llvm::InlineAsm::get(asm_ty, asm_code, constraints,
-                                         /*hasSideEffects=*/true,
-                                         /*alignStack=*/true,
-                                         llvm::InlineAsm::AD_ATT);
-    llvm::Value* asm_res = irb.CreateCall(asm_inst, asm_args);
-
-    // RIP and RSP are set outside of this function to allow for better
-    // optimizations for calls/jumps with known targets.
-    for (unsigned i = 0; i < sptr_geps.size(); i++)
-        irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
-
-    irb.CreateRetVoid();
-
-    return fn;
-}
 
 struct DbllHandle {
     llvm::LLVMContext ctx;
@@ -314,6 +199,10 @@ static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Module* mod,
     pb.registerLoopAnalyses(lam);
     pb.crossRegisterProxies(lam, fam, cgam, mam);
 
+    // Lower native calls in the beginning.
+    pb.registerPipelineStartEPCallback([] (llvm::ModulePassManager& mpm) {
+        mpm.addPass(dbll::LowerNativeCallPass());
+    });
     pb.registerPeepholeEPCallback([cfg] (llvm::FunctionPassManager& fpm,
                                        llvm::PassBuilder::OptimizationLevel ol) {
         fpm.addPass(dbll::ConstMemPropPass(cfg));
@@ -349,7 +238,6 @@ class Optimizer {
     bool Init();
     llvm::Function* Lift(BinoptFunc func);
     llvm::Function* Wrap(llvm::Function* orig_fn);
-    void LowerExternalCallToNative();
 
     static void OptimizeLight(llvm::Function* fn);
 
@@ -383,19 +271,13 @@ bool Optimizer::Init() {
 
     mod->setTargetTriple(triple);
 
-    llvm::Type* i1 = llvm::Type::getInt1Ty(ctx);
-    llvm::Type* i64 = llvm::Type::getInt64Ty(ctx);
     llvm::Type* i8p = llvm::Type::getInt8PtrTy(ctx);
-    llvm::Type* i64p = i64->getPointerTo();
     llvm::Type* void_ty = llvm::Type::getVoidTy(ctx);
     auto helper_ty = llvm::FunctionType::get(void_ty, {i8p}, false);
     auto linkage = llvm::GlobalValue::ExternalLinkage;
     rl_func_call = llvm::Function::Create(helper_ty, linkage, "call_fn", mod);
     rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn", mod);
-    // This is void(i8* sptr, i64* retaddr_ptr, i64 rip, i1 is_call)
-    auto helper_ext_ty = llvm::FunctionType::get(void_ty, {i8p, i64p, i64, i1}, false);
-    func_helper_ext = llvm::Function::Create(helper_ext_ty, linkage,
-                                             "ext_helper", mod);
+    func_helper_ext = dbll::LowerNativeCallPass::CreateNativeCallFn(*mod);
 
     rlcfg = ll_config_new();
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
@@ -654,30 +536,6 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     return fn;
 }
 
-void Optimizer::LowerExternalCallToNative() {
-    if (func_helper_ext->user_empty())
-        return;
-
-    llvm::Function* native_helper = dbll_create_native_helper(mod);
-
-    llvm::SmallVector<llvm::CallInst*, 8> tmp_insts;
-    for (const llvm::Use& use : func_helper_ext->uses()) {
-        llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to helper_ext");
-        tmp_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
-    }
-    for (llvm::CallInst* inst : tmp_insts) {
-        llvm::Value* args[2] = {inst->getArgOperand(0), inst->getArgOperand(1)};
-        auto* new_inst = llvm::CallInst::Create(native_helper, args);
-        llvm::ReplaceInstWithInst(inst, new_inst);
-
-        llvm::InlineFunctionInfo ifi;
-        llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
-    }
-
-    native_helper->removeFromParent();
-}
-
 void Optimizer::OptimizeLight(llvm::Function* fn) {
     // Do some very simple optimizations, so that calls to ext_helper are
     // simplified that a constant target RIP is propagated and subsequent
@@ -709,6 +567,7 @@ void Optimizer::OptimizeLight(llvm::Function* fn) {
     fpm.addPass(llvm::EarlyCSEPass(true));
     fpm.addPass(llvm::InstCombinePass(false));
     fpm.addPass(llvm::SimplifyCFGPass());
+    fpm.addPass(dbll::PtrToIntFoldPass());
     // fpm.addPass(llvm::AAEvaluator());
     fpm.run(*fn, fam);
 }
@@ -767,8 +626,6 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
         changed = !ext_call_queue.empty();
         ext_call_queue.clear();
     }
-
-    opt.LowerExternalCallToNative();
 
     if (cfg->log_level >= LogLevel::DEBUG)
         mod->print(llvm::dbgs(), nullptr);
