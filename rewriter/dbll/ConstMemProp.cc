@@ -5,6 +5,7 @@
 
 #include "binopt-config.h"
 
+#include <llvm/ADT/ArrayRef.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/InstIterator.h>
@@ -16,9 +17,9 @@
 namespace dbll {
 
 class ConstMemProp {
-    BinoptCfgRef cfg;
+    llvm::ArrayRef<ConstMemPropPass::MemRange> memranges;
 public:
-    ConstMemProp(BinoptCfgRef cfg) : cfg(cfg) {}
+    ConstMemProp(llvm::ArrayRef<ConstMemPropPass::MemRange> mr) : memranges(mr) {}
 
 private:
     // Returns 0 when the constant could not be folded.
@@ -52,12 +53,8 @@ private:
 
     std::pair<bool, llvm::APInt> GetConstantMem(uintptr_t addr, size_t size) {
         size_t size_bytes = (size + 7) / 8;
-        for (size_t i = 0; i < cfg->memrange_count; ++i) {
-            const auto& range = cfg->memranges[i];
-            if ((uintptr_t) range.base > addr ||
-                (uintptr_t) range.base + range.size < addr + size_bytes)
-                continue;
-            if (range.flags != BINOPT_MEM_CONST)
+        for (const auto& [r_start, r_len] : memranges) {
+            if (addr < r_start || addr + size_bytes > r_start + r_len)
                 continue;
 
             auto const_ptr = reinterpret_cast<const uint64_t*>(addr);
@@ -94,13 +91,6 @@ private:
         else
             const_val = llvm::ConstantExpr::getBitCast(const_int, target_ty);
 
-        if (cfg->log_level >= LogLevel::DEBUG) {
-            llvm::dbgs() << "folding load ";
-            load->print(llvm::dbgs());
-            llvm::dbgs() << " from " << llvm::format("%p", addr_val) << " to ";
-            const_val->print(llvm::dbgs());
-            llvm::dbgs() << "\n";
-        }
 
         return const_val;
     }
@@ -156,7 +146,7 @@ public:
 
 llvm::PreservedAnalyses ConstMemPropPass::run(llvm::Function& fn,
                                               llvm::FunctionAnalysisManager& fam) {
-  ConstMemProp cmp(cfg);
+  ConstMemProp cmp(memranges);
 
   if (!cmp.run(fn))
     return llvm::PreservedAnalyses::all();

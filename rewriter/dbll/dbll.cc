@@ -23,6 +23,7 @@
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -37,8 +38,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fstream>
 #include <iostream>
 #include <sstream>
+#include <string>
+#include <vector>
 
 /* DBLL based on LLVM+Rellume, using default configuration API */
 
@@ -174,50 +178,11 @@ public:
 
 llvm::AnalysisKey StrictSptrAA::Key;
 
-static void dbll_optimize_new_pm(BinoptCfgRef cfg, llvm::Module* mod,
-                                 llvm::TargetMachine* tm) {
-    llvm::PassBuilder pb(tm);
-
-    llvm::LoopAnalysisManager lam(false);
-    llvm::FunctionAnalysisManager fam(false);
-    llvm::CGSCCAnalysisManager cgam(false);
-    llvm::ModuleAnalysisManager mam(false);
-
-    // Register the AA manager
-    fam.registerPass([&] {
-        llvm::AAManager aa;
-        aa.registerFunctionAnalysis<StrictSptrAA>();
-        aa.registerFunctionAnalysis<llvm::BasicAA>();
-        return aa;
-    });
-    fam.registerPass([&] { return StrictSptrAA(); });
-
-    // Register analysis passes...
-    pb.registerModuleAnalyses(mam);
-    pb.registerCGSCCAnalyses(cgam);
-    pb.registerFunctionAnalyses(fam);
-    pb.registerLoopAnalyses(lam);
-    pb.crossRegisterProxies(lam, fam, cgam, mam);
-
-    // Lower native calls in the beginning.
-    pb.registerPipelineStartEPCallback([] (llvm::ModulePassManager& mpm) {
-        mpm.addPass(dbll::LowerNativeCallPass());
-    });
-    pb.registerPeepholeEPCallback([cfg] (llvm::FunctionPassManager& fpm,
-                                       llvm::PassBuilder::OptimizationLevel ol) {
-        fpm.addPass(dbll::ConstMemPropPass(cfg));
-    });
-    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
-    // mpm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::AAEvaluator()));
-
-    mpm.run(*mod, mam);
-    // mpm.run(*mod, mam);
-}
-
 namespace {
 
 class Optimizer {
     BinoptCfgRef cfg;
+    std::vector<dbll::ConstMemPropPass::MemRange> const_memranges;
 
     llvm::LLVMContext& ctx;
     llvm::Module* mod;
@@ -228,6 +193,7 @@ class Optimizer {
     llvm::Function* rl_func_call;
     llvm::Function* rl_func_tail;
     llvm::Function* func_helper_ext;
+    llvm::GlobalVariable* llvm_used;
 
     llvm::DenseMap<BinoptFunc, llvm::Function*> lifted_fns;
 
@@ -235,11 +201,18 @@ class Optimizer {
             : cfg(cfg), ctx(mod->getContext()), mod(mod) {}
     ~Optimizer();
 
+    void DebugPrint(int log_level, const char* name);
+
     bool Init();
     llvm::Function* Lift(BinoptFunc func);
+    bool DiscoverAndLift(void);
+
     llvm::Function* Wrap(llvm::Function* orig_fn);
 
     static void OptimizeLight(llvm::Function* fn);
+
+    void OptimizeHeavy();
+    void PrepareForCodeGen();
 
 public:
     static BinoptFunc OptimizeFromConfig(BinoptCfgRef cfg);
@@ -247,6 +220,14 @@ public:
 
 Optimizer::~Optimizer() {
     ll_config_free(rlcfg);
+}
+
+void Optimizer::DebugPrint(int log_level, const char* name) {
+    if (cfg->log_level < log_level)
+        return;
+    llvm::dbgs() << "==================================================\n"
+                 << "== Module dump: " << name << "\n";
+    mod->print(llvm::dbgs(), nullptr);
 }
 
 bool Optimizer::Init() {
@@ -279,6 +260,23 @@ bool Optimizer::Init() {
     rl_func_tail = llvm::Function::Create(helper_ty, linkage, "tail_fn", mod);
     func_helper_ext = dbll::LowerNativeCallPass::CreateNativeCallFn(*mod);
 
+    // Store references to functions in llvm.used to prevent early removal.
+    assert(!mod->getGlobalVariable("llvm.used") && "llvm.used already defined");
+    llvm::LLVMContext& ctx = mod->getContext();
+    llvm::Type* i8p_ty = llvm::Type::getInt8PtrTy(ctx);
+
+    llvm::SmallVector<llvm::Constant*, 4> used_vals;
+    used_vals.push_back(llvm::ConstantExpr::getPointerCast(rl_func_call, i8p_ty));
+    used_vals.push_back(llvm::ConstantExpr::getPointerCast(rl_func_tail, i8p_ty));
+    used_vals.push_back(llvm::ConstantExpr::getPointerCast(func_helper_ext, i8p_ty));
+
+    llvm::ArrayType* used_ty = llvm::ArrayType::get(i8p_ty, used_vals.size());
+    llvm_used = new llvm::GlobalVariable(
+            *mod, used_ty, /*const=*/false, llvm::GlobalValue::AppendingLinkage,
+            llvm::ConstantArray::get(used_ty, used_vals), "llvm.used");
+    llvm_used->setSection("llvm.metadata");
+
+    // Create Rellume config
     rlcfg = ll_config_new();
     ll_config_enable_fast_math(rlcfg, !!(cfg->fast_math & 1));
     ll_config_set_call_ret_clobber_flags(rlcfg, true);
@@ -286,6 +284,31 @@ bool Optimizer::Init() {
     ll_config_enable_full_facets(rlcfg, true);
     ll_config_set_tail_func(rlcfg, llvm::wrap(rl_func_tail));
     ll_config_set_call_func(rlcfg, llvm::wrap(rl_func_call));
+
+    for (size_t i = 0; i < cfg->memrange_count; i++) {
+        const auto* range = &cfg->memranges[i];
+        if (range->flags == BINOPT_MEM_CONST) {
+            uintptr_t base = reinterpret_cast<uintptr_t>(range->base);
+            const_memranges.push_back({base, range->size});
+        }
+    }
+
+    std::ifstream proc_maps;
+    proc_maps.open("/proc/self/maps");
+    if (proc_maps.is_open()) {
+        std::string map;
+        while (std::getline(proc_maps, map)) {
+            char *endptr;
+            uintptr_t start = strtoull(map.c_str(), &endptr, 16);
+            uintptr_t end = strtoull(++endptr, &endptr, 16);
+            bool prot_r = *(++endptr) == 'r';
+            bool prot_w = *(++endptr) == 'w';
+            // bool prot_x = *(++endptr) == 'x';
+
+            if (prot_r && !prot_w)
+                const_memranges.push_back({start, end-start});
+        }
+    }
 
     return true;
 }
@@ -296,8 +319,8 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
         return lifted_fns_iter->second;
 
     // Note: rl_func_call/rl_func_tail must have no uses before this function.
-    assert(rl_func_tail->user_empty() && "rl_func_tail has uses (before)");
-    assert(rl_func_call->user_empty() && "rl_func_call has uses (before)");
+    assert(rl_func_tail->hasOneUse() && "rl_func_tail has uses (before)");
+    assert(rl_func_call->hasOneUse() && "rl_func_call has uses (before)");
 
     LLFunc* rlfn = ll_func_new(llvm::wrap(mod), rlcfg);
     bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(func),
@@ -339,13 +362,15 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     llvm::SmallVector<std::pair<llvm::CallInst*, bool>, 8> tmp_insts;
     for (const llvm::Use& use : rl_func_tail->uses()) {
         llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to tail_fn");
+        if (!cs || !cs.isCallee(&use))
+            continue;
         llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
         tmp_insts.push_back(std::make_pair(call, false));
     }
     for (const llvm::Use& use : rl_func_call->uses()) {
         llvm::CallSite cs(use.getUser());
-        assert(cs && cs.isCallee(&use) && "strange reference to call_fn");
+        if (!cs || !cs.isCallee(&use))
+            continue;
         llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
         tmp_insts.push_back(std::make_pair(call, true));
     }
@@ -391,14 +416,56 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     tmp_insts.clear();
 
     // Note: rl_func_call/rl_func_tail must have no uses after this function.
-    assert(rl_func_tail->user_empty() && "rl_func_tail has uses (after)");
-    assert(rl_func_call->user_empty() && "rl_func_call has uses (after)");
+    assert(rl_func_tail->hasOneUse() && "rl_func_tail has uses (after)");
+    assert(rl_func_call->hasOneUse() && "rl_func_call has uses (after)");
 
     OptimizeLight(fn);
 
     lifted_fns[func] = fn;
 
     return fn;
+}
+
+bool Optimizer::DiscoverAndLift() {
+    // Try to iteratively discover called functions and lift them as well.
+    bool new_code = false;
+    bool changed = true;
+    llvm::SmallVector<std::pair<uint64_t, llvm::CallInst*>, 8> ext_call_queue;
+    while (changed) {
+        changed = false;
+        for (const llvm::Use& use : func_helper_ext->uses()) {
+            llvm::CallSite cs(use.getUser());
+            if (!cs || !cs.isCallee(&use))
+                continue;
+            llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
+            if (auto c = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
+                uint64_t addr = c->getUniqueInteger().getLimitedValue();
+                ext_call_queue.push_back(std::make_pair(addr, call));
+            }
+        }
+
+        for (auto [addr, inst] : ext_call_queue) {
+            llvm::Function* fn = Lift(reinterpret_cast<BinoptFunc>(addr));
+            if (!fn)
+                continue;
+
+            auto is_call = llvm::dyn_cast<llvm::Constant>(inst->getArgOperand(3));
+            auto* new_inst = llvm::CallInst::Create(fn, {inst->getArgOperand(0)});
+            llvm::ReplaceInstWithInst(inst, new_inst);
+
+            // Directly inline tail functions
+            if (is_call && is_call->isZeroValue()) {
+                llvm::InlineFunctionInfo ifi;
+                llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
+            }
+            new_code = true;
+            changed = true;
+        }
+
+        ext_call_queue.clear();
+    }
+
+    return new_code;
 }
 
 llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
@@ -572,6 +639,90 @@ void Optimizer::OptimizeLight(llvm::Function* fn) {
     fpm.run(*fn, fam);
 }
 
+void Optimizer::OptimizeHeavy() {
+    llvm::PassInstrumentationCallbacks pic;
+    llvm::StandardInstrumentations si;
+    si.registerCallbacks(pic);
+
+    llvm::PassBuilder pb(tm, llvm::PipelineTuningOptions(), llvm::None, &pic);
+
+    llvm::LoopAnalysisManager lam(false);
+    llvm::FunctionAnalysisManager fam(false);
+    llvm::CGSCCAnalysisManager cgam(false);
+    llvm::ModuleAnalysisManager mam(false);
+
+    fam.registerPass([&] {
+        llvm::AAManager aa;
+        aa.registerFunctionAnalysis<StrictSptrAA>();
+        aa.registerFunctionAnalysis<llvm::BasicAA>();
+        return aa;
+    });
+    fam.registerPass([&] { return StrictSptrAA(); });
+
+    // Register analysis passes...
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    pb.registerPeepholeEPCallback([this] (llvm::FunctionPassManager& fpm,
+                                       llvm::PassBuilder::OptimizationLevel ol) {
+        fpm.addPass(dbll::PtrToIntFoldPass());
+        fpm.addPass(dbll::ConstMemPropPass(const_memranges));
+    });
+    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
+    // mpm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::AAEvaluator()));
+
+    mpm.run(*mod, mam);
+}
+
+void Optimizer::PrepareForCodeGen() {
+    // Now we can let the optimizer remove all the function declarations.
+    // TODO: this apparently doesn' work.
+    // if (llvm_used) {
+    //     llvm_used->removeFromParent();
+    //     llvm_used = nullptr;
+    // }
+
+    // TODO: Don't run a full optimization pipeline here.
+    llvm::PassInstrumentationCallbacks pic;
+    llvm::StandardInstrumentations si;
+    si.registerCallbacks(pic);
+
+    llvm::PassBuilder pb(tm, llvm::PipelineTuningOptions(), llvm::None, &pic);
+
+    llvm::LoopAnalysisManager lam(false);
+    llvm::FunctionAnalysisManager fam(false);
+    llvm::CGSCCAnalysisManager cgam(false);
+    llvm::ModuleAnalysisManager mam(false);
+
+    // Register the AA manager
+    // fam.registerPass([&] { return pb.buildDefaultAAPipeline(); });
+    fam.registerPass([&] {
+        llvm::AAManager aa;
+        aa.registerFunctionAnalysis<StrictSptrAA>();
+        aa.registerFunctionAnalysis<llvm::BasicAA>();
+        return aa;
+    });
+    fam.registerPass([&] { return StrictSptrAA(); });
+
+    // Register analysis passes...
+    pb.registerModuleAnalyses(mam);
+    pb.registerCGSCCAnalyses(cgam);
+    pb.registerFunctionAnalyses(fam);
+    pb.registerLoopAnalyses(lam);
+    pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+    // Lower native calls in the beginning.
+    pb.registerPipelineStartEPCallback([] (llvm::ModulePassManager& mpm) {
+        mpm.addPass(dbll::LowerNativeCallPass());
+    });
+    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
+
+    mpm.run(*mod, mam);
+}
+
 BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
     DbllHandle* handle = reinterpret_cast<DbllHandle*>(cfg->handle);
     auto mod_u = std::make_unique<llvm::Module>("binopt", handle->ctx);
@@ -585,62 +736,33 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
     if (!fn)
         return nullptr;
 
-    if (cfg->log_level >= LogLevel::DEBUG)
-        mod->print(llvm::dbgs(), nullptr);
+    opt.DebugPrint(LogLevel::DEBUG, "Initially lifted");
 
     llvm::Function* wrapped_fn = opt.Wrap(fn);
     if (wrapped_fn == nullptr)
         return nullptr;
 
-    if (cfg->log_level >= LogLevel::DEBUG)
-        mod->print(llvm::dbgs(), nullptr);
+    opt.DebugPrint(LogLevel::DEBUG, "After ABI wrap");
 
-    // Try to iteratively discover called functions and lift them as well.
-    bool changed = true;
-    llvm::SmallVector<std::pair<uint64_t, llvm::CallInst*>, 8> ext_call_queue;
-    while (changed) {
-        changed = false;
-        for (const llvm::Use& use : opt.func_helper_ext->uses()) {
-            llvm::CallSite cs(use.getUser());
-            assert(cs && cs.isCallee(&use) && "strange reference to ext_helper");
-            llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
-            if (auto c = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
-                uint64_t addr = c->getUniqueInteger().getLimitedValue();
-                ext_call_queue.push_back(std::make_pair(addr, call));
-            }
-        }
+    opt.DiscoverAndLift();
+    bool new_code;
+    do {
+        opt.DebugPrint(LogLevel::DEBUG, "After discovery iteration");
+        opt.OptimizeHeavy();
+        new_code = opt.DiscoverAndLift();
+    } while (new_code);
 
-        for (auto [addr, inst] : ext_call_queue) {
-            llvm::Function* fn = opt.Lift(reinterpret_cast<BinoptFunc>(addr));
-            auto is_call = llvm::dyn_cast<llvm::Constant>(inst->getArgOperand(3));
-            auto* new_inst = llvm::CallInst::Create(fn, {inst->getArgOperand(0)});
-            llvm::ReplaceInstWithInst(inst, new_inst);
+    opt.DebugPrint(LogLevel::DEBUG, "After full discovery");
 
-            // Directly inline tail functions
-            if (is_call && is_call->isZeroValue()) {
-                llvm::InlineFunctionInfo ifi;
-                llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
-            }
-        }
+    opt.PrepareForCodeGen();
 
-        changed = !ext_call_queue.empty();
-        ext_call_queue.clear();
-    }
-
-    if (cfg->log_level >= LogLevel::DEBUG)
-        mod->print(llvm::dbgs(), nullptr);
+    opt.DebugPrint(LogLevel::INFO, "Before codegen");
 
     // This should only scream if our code has a bug.
     if (llvm::verifyFunction(*wrapped_fn, &llvm::errs())) {
         wrapped_fn->eraseFromParent();
         return nullptr;
     }
-
-    // dbll_optimize_fast(wrapped_fn);
-    dbll_optimize_new_pm(cfg, mod, opt.tm);
-
-    if (cfg->log_level >= LogLevel::INFO)
-        mod->print(llvm::dbgs(), nullptr);
 
     llvm::EngineBuilder builder(std::move(mod_u));
     llvm::ExecutionEngine* engine = builder.create(opt.tm);

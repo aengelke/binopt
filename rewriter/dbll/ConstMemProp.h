@@ -10,9 +10,14 @@
 namespace dbll {
 
 class ConstMemPropPass : public llvm::PassInfoMixin<ConstMemPropPass> {
-    BinoptCfgRef cfg;
 public:
-    ConstMemPropPass(BinoptCfgRef cfg) : cfg(cfg) {}
+    using MemRange = std::pair<uintptr_t, size_t>;
+
+private:
+    llvm::ArrayRef<MemRange> memranges;
+
+public:
+    ConstMemPropPass(llvm::ArrayRef<MemRange> mr) : memranges(mr) {}
 
     llvm::PreservedAnalyses run(llvm::Function& fn, llvm::FunctionAnalysisManager& fam);
 };
