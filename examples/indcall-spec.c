@@ -22,12 +22,13 @@ int main(int argc, char** argv) {
     BinoptCfgRef bcfg = binopt_cfg_new(boh, (BinoptFunc) func);
     binopt_cfg_type(bcfg, 2, BINOPT_TY_FLOAT, BINOPT_TY_FLOAT,
                     BINOPT_TY_PTR);
+    binopt_cfg_set_parami(bcfg, 1, (size_t) (void*) add_one);
 
     float (* new_func)(float, float(*)(float));
     *((BinoptFunc*) &new_func) = binopt_spec_create(bcfg);
 
     float res = new_func(5, add_two);
-    printf("5 * (5 + 2) = %f\n", res);
+    printf("5 * (5 + 2(1)) = %f\n", res);
 
     return 0;
 }

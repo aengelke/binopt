@@ -40,3 +40,4 @@ subdir('rewriter')
 
 subdir('benchmarks')
 subdir('examples')
+subdir('tests')
