@@ -17,7 +17,7 @@ namespace dbll {
 
 static const char* NATIVE_CALL_NAME = "dbll.native_call";
 
-static void LowerNativeCall(llvm::CallInst* call, llvm::GlobalValue* glob) {
+static void LowerNativeTail(llvm::CallInst* call, llvm::GlobalValue* glob) {
     // Create alloca in entry block to avoid RBP-relative addressing due to a
     // variable-size stack frame. RBP is set in the inline-assembly, but LLVM
     // apperently doesn't recognize this and generates the following:
@@ -123,8 +123,96 @@ static void LowerNativeCall(llvm::CallInst* call, llvm::GlobalValue* glob) {
     // optimizations for calls/jumps with known targets.
     for (unsigned i = 0; i < sptr_geps.size(); i++)
         irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
+}
 
-    call->eraseFromParent();
+static void LowerNativeCall(llvm::CallInst* call, llvm::GlobalValue* glob) {
+    // See above for a rationale for having the alloca in the entry block.
+    // TODO: maybe remove RBP from inline-assembly constraints
+    llvm::Function* fn = call->getParent()->getParent();
+    llvm::IRBuilder<> irb(fn->getEntryBlock().getFirstNonPHI());
+    // TODO: just one alloca per function
+    llvm::Value* asm_buf = irb.CreateAlloca(irb.getInt64Ty(), irb.getInt64(3));
+
+    irb.SetInsertPoint(call);
+
+    llvm::Type* i64p = irb.getInt64Ty()->getPointerTo();
+    llvm::Value* sptr = irb.CreateBitCast(call->getArgOperand(0), i64p);
+
+    llvm::Value* sptr_rsp = irb.CreateConstGEP1_64(sptr, 5);
+    llvm::Value* userrsp = irb.CreateLoad(irb.getInt64Ty(), sptr_rsp);
+    userrsp = irb.CreateAdd(userrsp, irb.getInt64(8)); // we use call ourselves
+    llvm::Value* userrsp_ptr = irb.CreateIntToPtr(userrsp, irb.getInt64Ty()->getPointerTo());
+
+    // Store user RIP at right address
+    irb.CreateStore(irb.CreateLoad(sptr), irb.CreateConstGEP1_64(userrsp_ptr, -1));
+
+    // Buffer area passed to inline asm.
+    // Contains: userrsp, userrdx, userrbx
+    irb.CreateStore(userrsp, irb.CreateConstGEP1_64(asm_buf, 0));
+
+    llvm::SmallVector<llvm::Value*, 31> sptr_geps;
+    llvm::SmallVector<llvm::Value*, 32> asm_args;
+
+    for (unsigned idx = 0; idx < 16; idx++) {
+        if (idx == 4)
+            continue; // Skip RSP
+        llvm::Value* ptr = irb.CreateConstGEP1_64(sptr, 1 + idx);
+        sptr_geps.push_back(ptr);
+        asm_args.push_back(irb.CreateLoad(irb.getInt64Ty(), ptr));
+    }
+    llvm::Type* sse_ty = llvm::VectorType::get(irb.getInt64Ty(), 2);
+    llvm::Value* sptr128 = irb.CreateBitCast(sptr, sse_ty->getPointerTo());
+    for (uint8_t idx = 0; idx < 16; idx++) {
+        llvm::Value* ptr = irb.CreateConstGEP1_64(sse_ty, sptr128, 10 + idx, "xmmgep");
+        sptr_geps.push_back(ptr);
+        asm_args.push_back(irb.CreateLoad(sse_ty, ptr));
+    }
+
+    // First construct ty_list for the return type
+    llvm::SmallVector<llvm::Type*, 32> ty_list;
+    for (llvm::Value* arg : asm_args)
+        ty_list.push_back(arg->getType());
+
+    llvm::Type* asm_ret_ty = llvm::StructType::get(irb.getContext(), ty_list);
+
+    // Store RBX and RDX in asm_buf
+    irb.CreateStore(asm_args[3], irb.CreateConstGEP1_64(asm_buf, 2));
+    irb.CreateStore(asm_args[2], irb.CreateConstGEP1_64(asm_buf, 1));
+    // RBX = asm_buf, RDX = glob
+    asm_args[3] = asm_buf;
+    asm_args[2] = glob;
+    ty_list[3] = i64p;
+    ty_list[2] = i64p;
+
+    asm_args.push_back(glob);
+    ty_list.push_back(i64p);
+
+    auto asm_ty = llvm::FunctionType::get(asm_ret_ty, ty_list, false);
+    const auto constraints =
+        "={ax},={cx},={dx},={bx},={bp},={si},={di},={r8},={r9},={r10},={r11},"
+        "={r12},={r13},={r14},={r15},={xmm0},={xmm1},={xmm2},={xmm3},={xmm4},"
+        "={xmm5},={xmm6},={xmm7},={xmm8},={xmm9},={xmm10},={xmm11},={xmm12},"
+        "={xmm13},={xmm14},={xmm15},0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,"
+        "17,18,19,20,21,22,23,24,25,26,27,28,29,30,i";
+    const auto asm_code =
+            "mov %rsp, (%rdx);" // store rsp in glob
+            "mov 0x0(%rbx), %rsp;" // setup user rsp
+            "mov 0x8(%rbx), %rdx;" // setup user rdx
+            "mov 0x10(%rbx), %rbx;" // setup user rbx
+            "callq *-0x8(%rsp);"
+            "movabs $62, %rsp;"
+            "mov (%rsp), %rsp;";
+
+    auto asm_inst = llvm::InlineAsm::get(asm_ty, asm_code, constraints,
+                                         /*hasSideEffects=*/true,
+                                         /*alignStack=*/true,
+                                         llvm::InlineAsm::AD_ATT);
+    llvm::Value* asm_res = irb.CreateCall(asm_inst, asm_args);
+
+    // RIP and RSP are set outside of this function to allow for better
+    // optimizations for calls/jumps with known targets.
+    for (unsigned i = 0; i < sptr_geps.size(); i++)
+        irb.CreateStore(irb.CreateExtractValue(asm_res, i), sptr_geps[i]);
 }
 
 llvm::PreservedAnalyses LowerNativeCallPass::run(llvm::Module& mod,
@@ -154,8 +242,15 @@ llvm::PreservedAnalyses LowerNativeCallPass::run(llvm::Module& mod,
                                           llvm::Constant::getNullValue(i64),
                                           "dbll.native_call.glob");
 
-    for (llvm::CallInst* call : call_insts)
-        LowerNativeCall(call, glob);
+    for (llvm::CallInst* call : call_insts) {
+        auto is_call = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(3));
+        if (is_call && !is_call->isZeroValue())
+            LowerNativeCall(call, glob);
+        else
+            LowerNativeTail(call, glob);
+
+        call->eraseFromParent();
+    }
 
     llvm::PreservedAnalyses pa;
     return pa;
