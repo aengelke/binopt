@@ -24,6 +24,8 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/Host.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/TargetRegistry.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -361,17 +363,15 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
 
     llvm::SmallVector<std::pair<llvm::CallInst*, bool>, 8> tmp_insts;
     for (const llvm::Use& use : rl_func_tail->uses()) {
-        llvm::CallSite cs(use.getUser());
-        if (!cs || !cs.isCallee(&use))
+        llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(use.getUser());
+        if (!call || call->getCalledFunction() != rl_func_tail)
             continue;
-        llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
         tmp_insts.push_back(std::make_pair(call, false));
     }
     for (const llvm::Use& use : rl_func_call->uses()) {
-        llvm::CallSite cs(use.getUser());
-        if (!cs || !cs.isCallee(&use))
+        llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(use.getUser());
+        if (!call || call->getCalledFunction() != rl_func_call)
             continue;
-        llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
         tmp_insts.push_back(std::make_pair(call, true));
     }
 
@@ -434,10 +434,9 @@ bool Optimizer::DiscoverAndLift() {
     while (changed) {
         changed = false;
         for (const llvm::Use& use : func_helper_ext->uses()) {
-            llvm::CallSite cs(use.getUser());
-            if (!cs || !cs.isCallee(&use))
+            llvm::CallInst* call = llvm::dyn_cast<llvm::CallInst>(use.getUser());
+            if (!call || call->getCalledFunction() != func_helper_ext)
                 continue;
-            llvm::CallInst* call = llvm::cast<llvm::CallInst>(cs.getInstruction());
             if (auto c = llvm::dyn_cast<llvm::Constant>(call->getArgOperand(2))) {
                 uint64_t addr = c->getUniqueInteger().getLimitedValue();
                 ext_call_queue.push_back(std::make_pair(addr, call));
@@ -456,7 +455,11 @@ bool Optimizer::DiscoverAndLift() {
             // Directly inline tail functions
             if (is_call && is_call->isZeroValue()) {
                 llvm::InlineFunctionInfo ifi;
+#if DBLL_LLVM_MAJOR < 11
                 llvm::InlineFunction(llvm::CallSite(new_inst), ifi);
+#else
+                llvm::InlineFunction(*new_inst, ifi);
+#endif
             }
             new_code = true;
             changed = true;
@@ -485,7 +488,11 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::Type* cpu_type = dbll_get_cpu_type(ctx);
     llvm::AllocaInst* alloca = irb.CreateAlloca(cpu_type, int{0});
     alloca->setMetadata("dbll.sptr", llvm::MDNode::get(ctx, {}));
+#if DBLL_LLVM_MAJOR < 10
     alloca->setAlignment(16);
+#else
+    alloca->setAlignment(llvm::Align(16));
+#endif
 
     // Set direction flag to zero
     irb.CreateStore(irb.getFalse(), dbll_gep_helper(irb, alloca, {0, 2, 6}));
@@ -552,7 +559,11 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
 
     llvm::Value* stack_sz_val = irb.getInt64(stack_size);
     llvm::AllocaInst* stack = irb.CreateAlloca(irb.getInt8Ty(), stack_sz_val);
+#if DBLL_LLVM_MAJOR < 10
     stack->setAlignment(16);
+#else
+    stack->setAlignment(llvm::Align(16));
+#endif
     llvm::Value* sp_ptr = irb.CreateGEP(stack, irb.getInt64(stack_frame_size));
     llvm::Value* sp = irb.CreatePtrToInt(sp_ptr, irb.getInt64Ty());
     irb.CreateStore(sp, dbll_gep_helper(irb, alloca, {0, 1, 4}));
@@ -596,7 +607,11 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     }
 
     llvm::InlineFunctionInfo ifi;
+#if DBLL_LLVM_MAJOR < 11
     llvm::InlineFunction(llvm::CallSite(call), ifi);
+#else
+    llvm::InlineFunction(*call, ifi);
+#endif
 
     OptimizeLight(fn);
 
@@ -671,7 +686,8 @@ void Optimizer::OptimizeHeavy() {
         fpm.addPass(dbll::PtrToIntFoldPass());
         fpm.addPass(dbll::ConstMemPropPass(const_memranges));
     });
-    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
+    auto ol = llvm::PassBuilder::OptimizationLevel::O3;
+    auto mpm = pb.buildPerModuleDefaultPipeline(ol, false);
     // mpm.addPass(llvm::createModuleToFunctionPassAdaptor(llvm::AAEvaluator()));
 
     mpm.run(*mod, mam);
@@ -718,7 +734,8 @@ void Optimizer::PrepareForCodeGen() {
     pb.registerPipelineStartEPCallback([] (llvm::ModulePassManager& mpm) {
         mpm.addPass(dbll::LowerNativeCallPass());
     });
-    auto mpm = pb.buildPerModuleDefaultPipeline(llvm::PassBuilder::O3, false);
+    auto ol = llvm::PassBuilder::OptimizationLevel::O3;
+    auto mpm = pb.buildPerModuleDefaultPipeline(ol, false);
 
     mpm.run(*mod, mam);
 }
@@ -769,7 +786,8 @@ BinoptFunc Optimizer::OptimizeFromConfig(BinoptCfgRef cfg) {
     if (!engine)
         return cfg->func; // we could not create the JIT engine
 
-    auto raw_ptr = engine->getFunctionAddress(wrapped_fn->getName());
+    const auto& name = wrapped_fn->getName();
+    auto raw_ptr = engine->getFunctionAddress(name.str());
 
     return reinterpret_cast<BinoptFunc>(raw_ptr);
 }

@@ -5,7 +5,6 @@
 
 #include "binopt-config.h"
 
-#include <llvm/IR/CallSite.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/InlineAsm.h>
@@ -223,12 +222,10 @@ llvm::PreservedAnalyses LowerNativeCallPass::run(llvm::Module& mod,
 
     llvm::SmallVector<llvm::CallInst*, 8> call_insts;
     for (const llvm::Use& use : native_call_fn->uses()) {
-        llvm::CallSite cs(use.getUser());
-        if (!cs || !cs.isCallee(&use))
+        llvm::CallInst* ci = llvm::dyn_cast<llvm::CallInst>(use.getUser());
+        if (!ci || ci->getCalledFunction() != native_call_fn)
             continue;
-        assert(cs.isCall() && "native_call with non-call instruction");
-
-        call_insts.push_back(llvm::cast<llvm::CallInst>(cs.getInstruction()));
+        call_insts.push_back(ci);
     }
 
     if (call_insts.empty())
