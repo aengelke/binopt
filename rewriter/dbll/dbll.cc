@@ -434,6 +434,23 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
 
     OptimizeLight(fn);
 
+    // Check if any tail call remains after optimization. If so, don't mark the
+    // function as inline.
+    bool has_tail_fn = false;
+    for (const llvm::Use& use : func_helper_ext->uses()) {
+        llvm::CallInst* ci = llvm::dyn_cast<llvm::CallInst>(use.getUser());
+        if (!ci || ci->getCalledFunction() != func_helper_ext ||
+            ci->getParent()->getParent() != fn)
+            continue;
+        auto is_call = llvm::dyn_cast<llvm::Constant>(ci->getArgOperand(3));
+        if (!is_call || is_call->isZeroValue())
+            has_tail_fn = true;
+    }
+    if (!has_tail_fn) {
+        fn->addFnAttr(llvm::Attribute::InlineHint);
+        fn->addFnAttr(llvm::Attribute::AlwaysInline);
+    }
+
     lifted_fns[func] = fn;
 
     return fn;
