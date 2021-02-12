@@ -320,6 +320,10 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     if (lifted_fns_iter != lifted_fns.end())
         return lifted_fns_iter->second;
 
+    // Do not lift PLT entries. This is "jmp [rip + <soff32>]".
+    if (*((uint8_t*) func) == 0xff && *((uint8_t*) func + 1) == 0x25)
+        return nullptr;
+
     // Note: rl_func_call/rl_func_tail must have no uses before this function.
     assert(rl_func_tail->hasOneUse() && "rl_func_tail has uses (before)");
     assert(rl_func_call->hasOneUse() && "rl_func_call has uses (before)");
