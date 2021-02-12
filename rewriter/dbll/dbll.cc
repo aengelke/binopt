@@ -324,6 +324,9 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     if (*((uint8_t*) func) == 0xff && *((uint8_t*) func + 1) == 0x25)
         return nullptr;
 
+    if (cfg->log_level >= LogLevel::DEBUG)
+        llvm::dbgs() << "Lifting " << (void*)func << "\n";
+
     // Note: rl_func_call/rl_func_tail must have no uses before this function.
     assert(rl_func_tail->hasOneUse() && "rl_func_tail has uses (before)");
     assert(rl_func_call->hasOneUse() && "rl_func_call has uses (before)");
@@ -332,6 +335,9 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     bool fail = ll_func_decode_cfg(rlfn, reinterpret_cast<uintptr_t>(func),
                                    nullptr, nullptr);
     if (fail) {
+        if (cfg->log_level >= LogLevel::DEBUG)
+            llvm::dbgs() << "Lifting " << (void*)func << " FAILED (decode).\n";
+
         ll_func_dispose(rlfn);
         return nullptr;
     }
@@ -339,8 +345,11 @@ llvm::Function* Optimizer::Lift(BinoptFunc func) {
     llvm::Value* fn_val = llvm::unwrap(ll_func_lift(rlfn));
     ll_func_dispose(rlfn);
 
-    if (!fn_val)
+    if (!fn_val) {
+        if (cfg->log_level >= LogLevel::DEBUG)
+            llvm::dbgs() << "Lifting " << (void*)func << " FAILED (lift).\n";
         return nullptr;
+    }
 
     llvm::Function* fn = llvm::cast<llvm::Function>(fn_val);
     fn->setLinkage(llvm::GlobalValue::PrivateLinkage);
@@ -449,6 +458,11 @@ bool Optimizer::DiscoverAndLift() {
 
         for (auto [addr, inst] : ext_call_queue) {
             llvm::Function* fn = Lift(reinterpret_cast<BinoptFunc>(addr));
+            if (cfg->log_level >= LogLevel::DEBUG) {
+                llvm::errs() << "selecting call: " << (void*) addr << " ";
+                inst->print(llvm::errs());
+                llvm::errs() << "; got " << fn << "\n";
+            }
             if (!fn)
                 continue;
 
@@ -477,8 +491,10 @@ bool Optimizer::DiscoverAndLift() {
 
 llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
     llvm::FunctionType* fnty = dbll_map_function_type(cfg);
-    if (fnty == nullptr) // if we don't support the type
+    if (fnty == nullptr) {// if we don't support the type
+        DebugPrint(LogLevel::WARNING, "unsupported function type");
         return nullptr;
+    }
 
     // Create new function
     llvm::LLVMContext& ctx = orig_fn->getContext();
@@ -554,6 +570,7 @@ llvm::Function* Optimizer::Wrap(llvm::Function* orig_fn) {
                 stackOffset += 8;
             }
         } else {
+            DebugPrint(LogLevel::WARNING, "unsupported parameter type");
             return nullptr;
         }
     }
