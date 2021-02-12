@@ -63,38 +63,39 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
         return cfg->func;
 
     for (size_t i = 0; i < cfg->param_count; ++i) {
-        if (cfg->params[i].ty == BINOPT_TY_PTR_NOALIAS)
+        struct BinoptCfgParam* param = &cfg->params[i];
+        if (param->ty == BINOPT_TY_PTR_NOALIAS)
             drob_cfg_set_ptr_flag(dcfg, i, DROB_PTR_FLAG_RESTRICT);
-        if (!cfg->params[i].const_val)
+        if (!param->const_val)
             continue;
-        switch (cfg->params[i].ty) {
+        switch (param->ty) {
         case BINOPT_TY_INT8:
-            drob_cfg_set_param_int8(dcfg, i, *(int8_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_int8(dcfg, i, *(int8_t*) param->const_val);
             break;
         case BINOPT_TY_INT16:
-            drob_cfg_set_param_int16(dcfg, i, *(int16_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_int16(dcfg, i, *(int16_t*) param->const_val);
             break;
         case BINOPT_TY_INT32:
-            drob_cfg_set_param_int32(dcfg, i, *(int32_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_int32(dcfg, i, *(int32_t*) param->const_val);
             break;
         case BINOPT_TY_INT64:
-            drob_cfg_set_param_int64(dcfg, i, *(int64_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_int64(dcfg, i, *(int64_t*) param->const_val);
             break;
         case BINOPT_TY_UINT8:
-            drob_cfg_set_param_uint8(dcfg, i, *(uint8_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint8(dcfg, i, *(uint8_t*) param->const_val);
             break;
         case BINOPT_TY_UINT16:
-            drob_cfg_set_param_uint16(dcfg, i, *(uint16_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint16(dcfg, i, *(uint16_t*) param->const_val);
             break;
         case BINOPT_TY_UINT32:
-            drob_cfg_set_param_uint32(dcfg, i, *(uint32_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint32(dcfg, i, *(uint32_t*) param->const_val);
             break;
         case BINOPT_TY_UINT64:
-            drob_cfg_set_param_uint64(dcfg, i, *(uint64_t*) cfg->params[i].const_val);
+            drob_cfg_set_param_uint64(dcfg, i, *(uint64_t*) param->const_val);
             break;
         case BINOPT_TY_PTR:
         case BINOPT_TY_PTR_NOALIAS:
-            drob_cfg_set_param_ptr(dcfg, i, *(const void**) cfg->params[i].const_val);
+            drob_cfg_set_param_ptr(dcfg, i, *(const void**) param->const_val);
             break;
         default:
             return cfg->func;
