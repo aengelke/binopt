@@ -845,3 +845,8 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
 void binopt_spec_delete(BinoptHandle handle, BinoptFunc spec_func) {
     // TODO: implement
 }
+
+__attribute__((constructor))
+static void dbll_support_pass_arguments(void) {
+    llvm::cl::ParseEnvironmentOptions("binopt-dbll", "DBLL_OPTS");
+}
