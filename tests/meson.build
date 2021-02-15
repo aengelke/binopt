@@ -10,6 +10,7 @@ tests = [
   [executable('test_alignment', 'alignment.c', dependencies: [binopt]), 0, 1, 1, 1],
   [executable('test_call', 'call.c', dependencies: [binopt]), 0, 1, 1, 0],
   [executable('test_indjmp-static', 'indjmp-static.c', dependencies: [binopt]), 0, 1, 1, 0],
+  [executable('test_indjmp-dynamic', 'indjmp-dynamic.c', dependencies: [binopt]), 0, 1, 1, 0],
 ]
 
 rewriters = [[binopt_lib, 'Default (no rewriting)', 1]]
