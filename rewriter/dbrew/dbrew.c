@@ -25,8 +25,12 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
         return cfg->func;
 
     Rewriter* r = dbrew_new();
-    dbrew_verbose(r, false, false, false);
-    dbrew_optverbose(r, false);
+    bool verbose = cfg->log_level >= 3;
+    dbrew_verbose(r, verbose, verbose, verbose);
+    dbrew_optverbose(r, verbose);
+    dbrew_set_decoding_capacity(r, 100000, 100);
+    // Set instrcount, bbcount, and codebuf size.
+    dbrew_set_capture_capacity(r, 1000000, 100, 0x100000);
     dbrew_set_function(r, (uintptr_t) cfg->func);
     dbrew_config_parcount(r, cfg->param_count);
     if (cfg->ret_ty == BINOPT_TY_FLOAT || cfg->ret_ty == BINOPT_TY_DOUBLE)
