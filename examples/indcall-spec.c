@@ -11,7 +11,7 @@ static float add_two(float a) {
     return a + 2.0f;
 }
 
-static float func(float a, float(* fn)(float)) {
+static float func(float(* fn)(float), float a) {
     return fn(a) * a;
 }
 
@@ -20,14 +20,14 @@ int main(int argc, char** argv) {
 
     BinoptHandle boh = binopt_init();
     BinoptCfgRef bcfg = binopt_cfg_new(boh, (BinoptFunc) func);
-    binopt_cfg_type(bcfg, 2, BINOPT_TY_FLOAT, BINOPT_TY_FLOAT,
-                    BINOPT_TY_PTR);
-    binopt_cfg_set_parami(bcfg, 1, (size_t) (void*) add_one);
+    binopt_cfg_type(bcfg, 2, BINOPT_TY_FLOAT, BINOPT_TY_PTR,
+                    BINOPT_TY_FLOAT);
+    binopt_cfg_set_parami(bcfg, 0, (size_t) (void*) add_one);
 
-    float (* new_func)(float, float(*)(float));
+    float (* new_func)(float(*)(float), float);
     *((BinoptFunc*) &new_func) = binopt_spec_create(bcfg);
 
-    float res = new_func(5, add_two);
+    float res = new_func(add_two, 5);
     printf("5 * (5 + 2(1)) = %f\n", res);
 
     return 0;
