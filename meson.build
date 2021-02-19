@@ -41,3 +41,10 @@ subdir('rewriter')
 subdir('benchmarks')
 subdir('examples')
 subdir('tests')
+
+pkg = import('pkgconfig')
+pkg.generate(binopt_lib,
+             version: '0.1',
+             name: 'binopt',
+             filebase: 'binopt',
+             description: 'Binary optimization library')
