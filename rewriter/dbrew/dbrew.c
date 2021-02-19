@@ -32,6 +32,15 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     // Set instrcount, bbcount, and codebuf size.
     dbrew_set_capture_capacity(r, 1000000, 100, 0x100000);
     dbrew_set_function(r, (uintptr_t) cfg->func);
+    for (size_t i = 0; i < cfg->implflag_count; i++) {
+        size_t val = cfg->implflags[i].val;
+        switch (cfg->implflags[i].flag) {
+        case 0x10001: // force unknown
+            dbrew_config_force_unknown(r, val);
+            break;
+        default: break; // ignore other flags.
+        }
+    }
     dbrew_config_parcount(r, cfg->param_count);
     if (cfg->ret_ty == BINOPT_TY_FLOAT || cfg->ret_ty == BINOPT_TY_DOUBLE)
         dbrew_config_returnfp(r);
