@@ -115,8 +115,9 @@ BinoptFunc binopt_spec_create(BinoptCfgRef cfg) {
     }
 
     drob_cfg_dump(dcfg);
-    drob_cfg_set_error_handling(dcfg, DROB_ERROR_HANDLING_ABORT);
-    return (BinoptFunc) drob_optimize((drob_f) cfg->func, dcfg);
+    drob_cfg_set_error_handling(dcfg, DROB_ERROR_HANDLING_RETURN_NULL);
+    BinoptFunc res = (BinoptFunc) drob_optimize((drob_f) cfg->func, dcfg);
+    return res ? res : cfg->func;
 }
 
 void binopt_spec_delete(BinoptHandle handle, BinoptFunc spec_func) {
