@@ -93,6 +93,20 @@ WEAK BinoptCfgRef binopt_cfg_clone(BinoptCfgRef base_cfg) {
         memcpy(new_memranges, base_cfg->memranges, sizeof(struct BinoptCfgMemrange) * base_cfg->memrange_count);
         new_cfg->memranges = new_memranges;
     }
+    if (base_cfg->implflags != NULL) {
+        struct BinoptCfgFlag* new_implflags = malloc(sizeof(struct BinoptCfgFlag) * new_cfg->implflag_alloc);
+        if (new_implflags == NULL) {
+            if (new_cfg->params)
+                for (size_t i = 0; i < new_cfg->param_count; ++i)
+                    free(new_cfg->params[i].const_val);
+            free(new_cfg->params);
+            free(new_cfg->memranges);
+            free(new_cfg);
+            return NULL;
+        }
+        memcpy(new_implflags, base_cfg->implflags, sizeof(struct BinoptCfgFlag) * base_cfg->implflag_count);
+        new_cfg->implflags = new_implflags;
+    }
     return new_cfg;
 }
 // Set function signature.
@@ -124,7 +138,21 @@ WEAK void binopt_cfg_set(BinoptCfgRef cfg, BinoptOptFlags flag, size_t val) {
     switch (flag) {
     case BINOPT_F_FASTMATH: cfg->fast_math = !!val; break;
     case BINOPT_F_LOGLEVEL: cfg->log_level = val; break;
-    default: break; // ignore unknown flags
+    default:
+        if (cfg->implflag_count == cfg->implflag_alloc) {
+            size_t new_cnt = 2 * cfg->implflag_alloc;
+            size_t new_size = (new_cnt ? new_cnt : 8) * sizeof(*(cfg->implflags));
+            void* new_flags = realloc(cfg->implflags, new_size);
+            if (new_flags == NULL)
+                return; // old flags are left untouched
+            cfg->implflags = new_flags;
+            cfg->implflag_alloc = new_cnt;
+        }
+
+        size_t flag_idx = cfg->implflag_count++;
+        cfg->implflags[flag_idx].flag = flag;
+        cfg->implflags[flag_idx].val = val;
+        break;
     }
 }
 WEAK void binopt_cfg_set_param(BinoptCfgRef cfg, unsigned idx, const void* val) {

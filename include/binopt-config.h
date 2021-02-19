@@ -40,6 +40,13 @@ struct BinoptCfg {
         size_t size;
         BinoptMemFlags flags;
     }* memranges;
+
+    size_t implflag_count;
+    size_t implflag_alloc;
+    struct BinoptCfgFlag {
+        BinoptOptFlags flag;
+        size_t val;
+    }* implflags;
 };
 
 #ifdef __cplusplus
